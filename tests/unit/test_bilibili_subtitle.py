@@ -148,3 +148,60 @@ def test_fetch_bilibili_subtitle_with_protocol_fix():
     # 验证第二次请求的 URL 包含 https:
     second_call = mock_instance.get.call_args_list[1]
     assert second_call[0][0].startswith("https://")
+
+
+def test_fetch_bilibili_subtitle_falls_back_to_dm_view_ai_subtitle():
+    mock_wbi_response = MagicMock()
+    mock_wbi_response.status_code = 200
+    mock_wbi_response.json.return_value = {
+        "code": 0,
+        "data": {
+            "subtitle": {
+                "subtitles": []
+            }
+        }
+    }
+
+    mock_dm_response = MagicMock()
+    mock_dm_response.status_code = 200
+    mock_dm_response.json.return_value = {
+        "code": 0,
+        "data": {
+            "subtitle": {
+                "subtitles": [
+                    {
+                        "subtitle_url": "https://i0.hdslb.com/bfs/subtitle/ai.json",
+                        "lan": "ai-zh",
+                        "lan_doc": "AI Chinese",
+                    }
+                ]
+            }
+        }
+    }
+
+    mock_subtitle_response = MagicMock()
+    mock_subtitle_response.status_code = 200
+    mock_subtitle_response.json.return_value = {
+        "body": [
+            {"from": 0.0, "to": 2.0, "content": "first ai segment"},
+            {"from": 2.0, "to": 4.5, "content": "second ai segment"},
+        ]
+    }
+
+    with patch("httpx.Client") as mock_client:
+        mock_instance = mock_client.return_value.__enter__.return_value
+        mock_instance.get.side_effect = [mock_wbi_response, mock_dm_response, mock_subtitle_response]
+
+        result = fetch_bilibili_subtitle(aid=12345, cid=67890, cookie="SESSDATA=test", bvid="BV1test")
+
+    assert result is not None
+    assert result["transcript"] == "first ai segment\nsecond ai segment"
+    assert result["segments"] == [
+        {"start": 0.0, "end": 2.0, "text": "first ai segment"},
+        {"start": 2.0, "end": 4.5, "text": "second ai segment"},
+    ]
+
+    requested_urls = [call.args[0] for call in mock_instance.get.call_args_list]
+    assert requested_urls[0] == "https://api.bilibili.com/x/player/wbi/v2?bvid=BV1test&cid=67890"
+    assert requested_urls[1] == "https://api.bilibili.com/x/v2/dm/view?type=1&oid=67890&pid=12345"
+    assert requested_urls[2] == "https://i0.hdslb.com/bfs/subtitle/ai.json"
