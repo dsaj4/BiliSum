@@ -355,6 +355,7 @@ class RealPipelineRunner(PipelineRunner):
 
         # 尝试获取 Bilibili 字幕
         transcript, segments = None, []
+        transcript_source: dict[str, object] | None = None
         logger.info(
             "bilibili subtitle check: prefer=%s platform=%s",
             self._settings.prefer_bilibili_subtitle,
@@ -412,6 +413,9 @@ class RealPipelineRunner(PipelineRunner):
                     if subtitle_result:
                         transcript = subtitle_result["transcript"]
                         segments = subtitle_result["segments"]
+                        metadata = subtitle_result.get("metadata")
+                        if isinstance(metadata, dict):
+                            transcript_source = metadata
                         emit("fetching_subtitle", 52, f"已获取字幕，共 {len(segments)} 段，跳过转写")
                         logger.info(
                             "bilibili subtitle used task_id=%s segments=%d chars=%d",
@@ -448,6 +452,8 @@ class RealPipelineRunner(PipelineRunner):
             prompt_preset_id=task_input.options.prompt_preset_id,
         )
         emit("exporting", 97, "正在导出任务结果")
+        if transcript_source:
+            summary["transcriptSource"] = transcript_source
         result = self._export_result(task_dir, title, transcript, segments, summary)
         emit(
             "exporting",
@@ -2181,6 +2187,7 @@ class RealPipelineRunner(PipelineRunner):
             {"llm_enabled": self._settings.llm_enabled and bool(self._settings.llm_api_key)},
         )
         used_llm_summary = False
+        llm_fallback_reason = ""
         if self._settings.llm_enabled and self._settings.llm_api_key:
             emit("summarizing", 91, f"正在请求 LLM：{self._settings.llm_model or '未命名模型'}")
             logger.info(
@@ -2210,6 +2217,7 @@ class RealPipelineRunner(PipelineRunner):
                     )
                 used_llm_summary = True
             except (LLMAuthenticationError, LLMConfigurationError) as exc:
+                llm_fallback_reason = str(exc)
                 logger.warning("llm unavailable, fallback to rule summary reason=%s", exc)
                 emit(
                     "summarizing",
@@ -2220,6 +2228,7 @@ class RealPipelineRunner(PipelineRunner):
                 summary = self._summarize_with_rules(transcript, segments, title)
         else:
             emit("summarizing", 91, "未启用 LLM，使用本地规则摘要")
+            llm_fallback_reason = "llm_not_configured"
             logger.info("rule summary start transcript_chars=%d segments=%d", len(transcript), len(segments))
             summary = self._summarize_with_rules(transcript, segments, title)
         summary = self._normalize_summary(summary, transcript, segments, title)
@@ -2280,6 +2289,16 @@ class RealPipelineRunner(PipelineRunner):
             len(summary.get("chapters", [])),
             len(str(summary.get("overview") or "")),
         )
+        summary["llmDiagnostics"] = {
+            "enabled": bool(self._settings.llm_enabled and self._settings.llm_api_key),
+            "used": used_llm_summary,
+            "provider": self._settings.llm_provider,
+            "model": self._settings.llm_model,
+            "fallback_reason": llm_fallback_reason,
+            "prompt_tokens": _safe_int(summary.get("llm_prompt_tokens")),
+            "completion_tokens": _safe_int(summary.get("llm_completion_tokens")),
+            "total_tokens": _safe_int(summary.get("llm_total_tokens")),
+        }
         return summary
 
     def _build_summary_start_message(self) -> str:
@@ -5662,6 +5681,20 @@ P 数索引：
         artifacts: dict[str, str] | None = None,
     ) -> TaskResult:
         knowledge_note_markdown = str(summary.get("knowledgeNoteMarkdown") or "").strip()
+        result_artifacts = dict(artifacts or {})
+        transcript_source = summary.get("transcriptSource")
+        if isinstance(transcript_source, dict):
+            result_artifacts["transcript_provider"] = str(transcript_source.get("provider") or "bilibili-subtitle")
+            result_artifacts["subtitle_provider"] = str(transcript_source.get("lan") or transcript_source.get("source") or "subtitle")
+            result_artifacts["transcript_source_json"] = json.dumps(transcript_source, ensure_ascii=False)
+        llm_diagnostics = summary.get("llmDiagnostics")
+        if isinstance(llm_diagnostics, dict):
+            result_artifacts["llm_enabled"] = "true" if llm_diagnostics.get("enabled") else "false"
+            result_artifacts["llm_used"] = "true" if llm_diagnostics.get("used") else "false"
+            result_artifacts["llm_provider"] = str(llm_diagnostics.get("provider") or "")
+            result_artifacts["llm_model"] = str(llm_diagnostics.get("model") or "")
+            result_artifacts["llm_fallback_reason"] = str(llm_diagnostics.get("fallback_reason") or "")
+            result_artifacts["llm_diagnostics_json"] = json.dumps(llm_diagnostics, ensure_ascii=False)
         return TaskResult(
             overview=str(summary.get("overview") or ""),
             knowledge_note_markdown=knowledge_note_markdown,
@@ -5695,7 +5728,7 @@ P 数索引：
                 for group in summary.get("chapterGroups", [])
                 if isinstance(group, dict)
             ],
-            artifacts=artifacts or {},
+            artifacts=result_artifacts,
             llm_prompt_tokens=_safe_int(summary.get("llm_prompt_tokens")),
             llm_completion_tokens=_safe_int(summary.get("llm_completion_tokens")),
             llm_total_tokens=_safe_int(summary.get("llm_total_tokens")),

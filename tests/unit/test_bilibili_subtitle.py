@@ -42,6 +42,9 @@ def test_fetch_bilibili_subtitle_success():
     assert result is not None
     assert result["transcript"] == "第一句\n第二句"
     assert len(result["segments"]) == 2
+    assert result["metadata"]["lan"] == "zh-CN"
+    assert result["metadata"]["source"] == "wbi"
+    assert result["metadata"]["url_host"] == "i0.hdslb.com"
     assert result["segments"][0] == {"start": 0.0, "end": 1.5, "text": "第一句"}
     assert result["segments"][1] == {"start": 1.5, "end": 3.0, "text": "第二句"}
 
@@ -200,6 +203,9 @@ def test_fetch_bilibili_subtitle_falls_back_to_dm_view_ai_subtitle():
         {"start": 0.0, "end": 2.0, "text": "first ai segment"},
         {"start": 2.0, "end": 4.5, "text": "second ai segment"},
     ]
+    assert result["metadata"]["lan"] == "ai-zh"
+    assert result["metadata"]["is_ai"] is True
+    assert result["metadata"]["source"] == "dm_view"
 
     requested_urls = [call.args[0] for call in mock_instance.get.call_args_list]
     assert requested_urls[0] == "https://api.bilibili.com/x/player/wbi/v2?bvid=BV1test&cid=67890"

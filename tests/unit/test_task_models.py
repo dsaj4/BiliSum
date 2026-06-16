@@ -362,9 +362,9 @@ def test_aggregate_series_note_prompt_uses_page_positioning() -> None:
     assert "回看路径" in contents
 
 
-def test_export_result_preserves_llm_usage() -> None:
+def test_export_result_preserves_llm_usage(tmp_path: Path) -> None:
     runner = RealPipelineRunner(PipelineSettings(tasks_dir=Path(".")))
-    task_dir = Path("tests") / "tmp_export_result"
+    task_dir = tmp_path / "tmp_export_result"
     task_dir.mkdir(parents=True, exist_ok=True)
 
     result = runner._export_result(
@@ -381,6 +381,24 @@ def test_export_result_preserves_llm_usage() -> None:
             "llm_prompt_tokens": 123,
             "llm_completion_tokens": 456,
             "llm_total_tokens": 579,
+            "llmDiagnostics": {
+                "enabled": True,
+                "used": True,
+                "provider": "openai-compatible",
+                "model": "deepseek-test",
+                "fallback_reason": "",
+                "prompt_tokens": 123,
+                "completion_tokens": 456,
+                "total_tokens": 579,
+            },
+            "transcriptSource": {
+                "provider": "bilibili-subtitle",
+                "source": "dm_view",
+                "lan": "ai-zh",
+                "lan_doc": "AI Chinese",
+                "is_ai": True,
+                "url_host": "i0.hdslb.com",
+            },
         },
     )
 
@@ -390,6 +408,10 @@ def test_export_result_preserves_llm_usage() -> None:
     assert result.knowledge_note_markdown.startswith("# 测试标题")
     assert result.chapter_groups[0]["children"][0]["title"] == "章节 1"
     assert result.artifacts["knowledge_note_path"].endswith("knowledge_note.md")
+    assert result.artifacts["llm_used"] == "true"
+    assert result.artifacts["llm_model"] == "deepseek-test"
+    assert result.artifacts["subtitle_provider"] == "ai-zh"
+    assert "transcript_source_json" in result.artifacts
 
 
 def test_real_pipeline_normalizes_mindmap_payload_and_repairs_leaf_time() -> None:

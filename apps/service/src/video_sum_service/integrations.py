@@ -643,6 +643,7 @@ def fetch_bilibili_subtitle(
                 pass
 
         subtitles = []
+        subtitle_source = ""
 
         # 方法1：WBI API（获取 UP 主上传的字幕）
         if bvid:
@@ -655,6 +656,8 @@ def fetch_bilibili_subtitle(
                     wbi_data = wbi_resp.json()
                     if wbi_data.get("code") == 0:
                         subtitles = wbi_data.get("data", {}).get("subtitle", {}).get("subtitles", [])
+                        if subtitles:
+                            subtitle_source = "wbi"
                         if subtitles:
                             logger.info("bilibili subtitle fetched via WBI API (UP主字幕)")
             except Exception as e:
@@ -671,6 +674,8 @@ def fetch_bilibili_subtitle(
                     dm_data = dm_resp.json()
                     if dm_data.get("code") == 0:
                         subtitles = dm_data.get("data", {}).get("subtitle", {}).get("subtitles", [])
+                        if subtitles:
+                            subtitle_source = "dm_view"
                         if subtitles:
                             logger.info("bilibili subtitle fetched via dm/view API (AI字幕)")
             except Exception as e:
@@ -784,7 +789,18 @@ def fetch_bilibili_subtitle(
 
         transcript = "\n".join(transcript_parts)
         logger.info("bilibili subtitle fetched successfully segments=%d chars=%d", len(segments), len(transcript))
-        return {"transcript": transcript, "segments": segments}
+        return {
+            "transcript": transcript,
+            "segments": segments,
+            "metadata": {
+                "provider": "bilibili-subtitle",
+                "source": subtitle_source,
+                "lan": selected_subtitle.get("lan", ""),
+                "lan_doc": selected_subtitle.get("lan_doc", ""),
+                "is_ai": str(selected_subtitle.get("lan", "")).startswith("ai-"),
+                "url_host": parsed.netloc,
+            },
+        }
 
     except Exception as exc:
         logger.warning("bilibili subtitle fetch failed: %s", exc, exc_info=True)
