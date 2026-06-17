@@ -571,6 +571,8 @@ class ServiceSettings(BaseSettings):
     llm_enabled: bool = False
     auto_generate_mindmap: bool = False
     visual_note_mode: str = "text"
+    note_modes: list[str] = Field(default_factory=lambda: ["knowledge_note"])
+    primary_note_mode: str = "knowledge_note"
     visual_evidence_enabled: bool = False
     visual_multimodal_enabled: bool = False
     visual_download_resolution: str = "720p"

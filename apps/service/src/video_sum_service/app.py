@@ -5,12 +5,15 @@ import subprocess
 import sys
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from video_sum_service.auth import is_auth_exempt_path, request_is_authorized, unauthorized_response
 from video_sum_core.models.tasks import TaskStatus
+from video_sum_core.note_modes import UnknownNoteModeError
 from video_sum_infra.db import connect_sqlite
 from video_sum_infra.config import normalize_visual_note_mode
 from video_sum_infra.runtime import (
@@ -141,6 +144,13 @@ app.include_router(system_router)
 app.include_router(videos_router)
 app.include_router(tasks_router)
 app.include_router(knowledge_router)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    if any(isinstance(error.get("ctx", {}).get("error"), UnknownNoteModeError) for error in exc.errors()):
+        return JSONResponse(status_code=400, content={"detail": "Unknown note mode."})
+    return await request_validation_exception_handler(request, exc)
 
 
 @app.middleware("http")

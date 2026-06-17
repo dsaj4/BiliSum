@@ -52,7 +52,19 @@ from video_sum_core.errors import (
     UnsupportedInputError,
     VideoSumError,
 )
-from video_sum_core.models.tasks import InputType, MindMapNode, TaskInput, TaskMindMap, TaskResult
+from video_sum_core.models.tasks import InputType, MindMapNode, NoteVariant, TaskInput, TaskMindMap, TaskResult
+from video_sum_core.note_modes import (
+    DETAILED_RECORD_MODE,
+    KNOWLEDGE_NOTE_MODE,
+    NOTE_MODE_REGISTRY,
+    build_detailed_record_fallback,
+    detailed_record_quality,
+    normalize_detailed_record_payload,
+    normalize_note_modes,
+    normalize_primary_note_mode,
+    note_mode_definition,
+    render_detailed_record_markdown,
+)
 from video_sum_core.pipeline.base import (
     PipelineContext,
     PipelineEvent,
@@ -449,12 +461,21 @@ class RealPipelineRunner(PipelineRunner):
             segments,
             title,
             emit,
+            note_modes=task_input.options.note_modes,
             prompt_preset_id=task_input.options.prompt_preset_id,
         )
         emit("exporting", 97, "正在导出任务结果")
         if transcript_source:
             summary["transcriptSource"] = transcript_source
-        result = self._export_result(task_dir, title, transcript, segments, summary)
+        result = self._export_result(
+            task_dir,
+            title,
+            transcript,
+            segments,
+            summary,
+            note_modes=task_input.options.note_modes,
+            primary_note_mode=task_input.options.primary_note_mode,
+        )
         emit(
             "exporting",
             98,
@@ -504,10 +525,19 @@ class RealPipelineRunner(PipelineRunner):
             title,
             emit,
             source_kind=source_kind,
+            note_modes=context.task_input.options.note_modes,
             prompt_preset_id=context.task_input.options.prompt_preset_id,
         )
         emit("exporting", 97, "正在导出新的摘要结果")
-        result = self._export_result(task_dir, title, transcript, segments, summary)
+        result = self._export_result(
+            task_dir,
+            title,
+            transcript,
+            segments,
+            summary,
+            note_modes=context.task_input.options.note_modes,
+            primary_note_mode=context.task_input.options.primary_note_mode,
+        )
         emit(
             "exporting",
             98,
@@ -571,10 +601,19 @@ class RealPipelineRunner(PipelineRunner):
             segments,
             title,
             emit,
+            note_modes=task_input.options.note_modes,
             prompt_preset_id=task_input.options.prompt_preset_id,
         )
         emit("exporting", 97, "正在导出任务结果")
-        result = self._export_result(task_dir, title, transcript, segments, summary)
+        result = self._export_result(
+            task_dir,
+            title,
+            transcript,
+            segments,
+            summary,
+            note_modes=task_input.options.note_modes,
+            primary_note_mode=task_input.options.primary_note_mode,
+        )
         emit(
             "exporting",
             98,
@@ -2178,8 +2217,10 @@ class RealPipelineRunner(PipelineRunner):
         title: str,
         emit: Callable[[str, int, str, dict[str, object] | None], None],
         source_kind: str | None = None,
+        note_modes: list[str] | None = None,
         prompt_preset_id: str | None = None,
     ) -> dict[str, object]:
+        requested_note_modes = normalize_note_modes(note_modes)
         emit(
             "summarizing",
             88,
@@ -2241,7 +2282,7 @@ class RealPipelineRunner(PipelineRunner):
                 "result_scope": "knowledge_cards",
             },
         )
-        if used_llm_summary:
+        if used_llm_summary and KNOWLEDGE_NOTE_MODE in requested_note_modes:
             emit("summarizing", 96, "正在生成知识笔记")
             try:
                 note_payload = self._generate_knowledge_note_with_llm(
@@ -3085,6 +3126,101 @@ P 数索引：
             raise VideoSumError("LLM returned empty knowledge note markdown.")
         return result
 
+    def _build_llm_detailed_record_payload(
+        self,
+        title: str,
+        transcript_excerpt: str,
+        segments_excerpt: str,
+        summary_json: str,
+    ) -> dict[str, object]:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是一个严谨的中文转写稿编辑。"
+                    "你的任务是把散乱的视频字幕整理成语篇规整后的增强版转写稿。"
+                    "必须忠实呈现原始材料的表述、顺序、人称和语气；不要总结、不要改写成第三人称、不要补充外部信息。"
+                    "You must return valid json only."
+                ),
+            },
+            {
+                "role": "user",
+                "content": self._render_user_prompt_template(
+                    """请输出一个 JSON 对象，顶层只包含 title、sections、timeline。
+目标：生成“逐句实录”。这里的“逐句”不是逐字字幕，而是按章节/语义联系切分的微段转写稿。
+它和知识笔记不同：不要提炼知识点，不要总结观点，不要把“我”改成“作者/UP 主”，不要替原视频下结论。
+
+约束：
+1. sections 必须按时间升序排列；每个 section 对应一个自然章节或语义连续片段。
+2. 每个 section 必须包含 id、index、title、start、end、sourceSegmentIds、microSegments。
+3. microSegments 是语篇规整后的微段；每个微段必须包含 id、index、start、end、text、sourceSegmentIds、visualRefs。
+4. text 要忠实保留原始材料的表达方式、人称、语气和细节，只做断句、标点、去明显口误/重复、合并碎片短句。
+5. text 不要写成“作者介绍/作者认为/本段说明”这类总结句，也不要改成知识点列表。
+6. 可以修正明显 ASR 错字，但不能新增原文没有的概念、例子、判断或解释。
+7. title 只作为导航标签，应该短，不要承载总结结论。
+8. visualRefs 暂无视觉证据时返回空数组；timeline 按 section 生成。
+9. 不要输出 Markdown，不要代码围栏，不要 JSON 外的文字。
+输出示例：
+{{"title":"","sections":[{{"id":"sec_1","index":1,"title":"","start":0,"end":60,"sourceSegmentIds":[1,2],"microSegments":[{{"id":"m1","index":1,"start":0,"end":12,"text":"我最近做了一个帮助自己学习的项目，这个项目对我的学习帮助很大。","sourceSegmentIds":[1],"visualRefs":[]}}]}}],"timeline":[{{"start":0,"end":60,"title":""}}]}}
+
+视频标题：{title}
+
+结构化摘要：
+{summary_json}
+
+转写节选：
+{transcript_excerpt}
+
+分段数据节选：
+{segments_excerpt}""",
+                    title=title,
+                    transcript_excerpt=transcript_excerpt,
+                    segments_excerpt=segments_excerpt,
+                    summary_json=summary_json,
+                ),
+            },
+        ]
+        return {
+            "model": self._settings.llm_model,
+            "messages": self._ensure_json_keyword_in_messages(messages),
+            "response_format": {"type": "json_object"},
+            "enable_thinking": False,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+
+    def _generate_detailed_record_with_llm(
+        self,
+        transcript: str,
+        segments: list[dict[str, object]],
+        title: str,
+        summary: dict[str, object],
+    ) -> dict[str, object]:
+        base_url = (self._settings.llm_base_url or "").rstrip("/")
+        if not base_url or not self._settings.llm_model:
+            raise LLMConfigurationError("LLM 配置不完整，无法生成逐句实录。")
+        transcript_excerpt = self._build_transcript_excerpt(transcript)
+        segments_excerpt = self._build_segments_excerpt(segments)
+        summary_json = _truncate_text(
+            json.dumps(
+                {
+                    "title": summary.get("title"),
+                    "overview": summary.get("overview"),
+                    "bulletPoints": summary.get("bulletPoints"),
+                    "chapters": summary.get("chapters"),
+                    "chapterGroups": summary.get("chapterGroups"),
+                },
+                ensure_ascii=False,
+            ),
+            3600,
+        )
+        payload = self._build_llm_detailed_record_payload(
+            title=title,
+            transcript_excerpt=transcript_excerpt,
+            segments_excerpt=segments_excerpt,
+            summary_json=summary_json,
+        )
+        return self._request_llm_json(base_url=base_url, payload=payload)
+
     def build_and_export_mindmap(
         self,
         task_id: str,
@@ -3111,7 +3247,10 @@ P 数索引：
         on_event: Callable[[PipelineEvent], None] | None = None,
     ) -> tuple[dict[str, object], Path, Path]:
         task_dir = ensure_directory(self._settings.tasks_dir / task_id)
+        base_note = self._visual_base_note(result)
         visual_dir = task_dir / "visual_evidence"
+        if base_note["mode"] != KNOWLEDGE_NOTE_MODE:
+            visual_dir = visual_dir / str(base_note["mode"])
         if force and visual_dir.exists():
             shutil.rmtree(visual_dir)
         visual_dir = ensure_directory(visual_dir)
@@ -3142,6 +3281,8 @@ P 数索引：
                 keyframe_plan_path=keyframe_plan_path,
                 insert_plan_path=insert_plan_path,
                 mode=mode,
+                note_mode=str(base_note["mode"]),
+                note_label=str(base_note["label"]),
                 insert_count=0,
             )
             self._write_json_atomic(context_path, context)
@@ -3181,6 +3322,8 @@ P 数索引：
                 keyframe_plan_path=keyframe_plan_path,
                 insert_plan_path=insert_plan_path,
                 mode=mode,
+                note_mode=str(base_note["mode"]),
+                note_label=str(base_note["label"]),
                 insert_count=0,
             )
             self._write_json_atomic(context_path, context)
@@ -3240,6 +3383,7 @@ P 数索引：
         enhanced_note_markdown = self._compose_visual_enhanced_note(
             title=title,
             result=result,
+            base_note_markdown=str(base_note["markdown"]),
             observations=observations,
             insert_plan=insert_plan,
             mode=mode,
@@ -3260,6 +3404,8 @@ P 数索引：
             keyframe_plan_path=keyframe_plan_path,
             insert_plan_path=insert_plan_path,
             mode=mode,
+            note_mode=str(base_note["mode"]),
+            note_label=str(base_note["label"]),
             insert_count=len(insert_plan.get("insertions", [])) if isinstance(insert_plan.get("insertions"), list) else 0,
         )
         self._write_json_atomic(context_path, context)
@@ -3283,12 +3429,13 @@ P 数索引：
         visual_enabled = self._settings.visual_evidence_enabled or task_explicitly_requests_visual
         if not visual_enabled or mode == "text":
             return result.model_copy(update={"visual_note_mode": mode})
-        if not result.knowledge_note_markdown.strip():
+        base_note = self._visual_base_note(result)
+        if not str(base_note["markdown"]).strip():
             return result.model_copy(
                 update={
                     "visual_note_mode": mode,
                     "visual_note_status": "skipped",
-                    "visual_note_error_message": "纯文本知识笔记为空，已跳过图文笔记。",
+                    "visual_note_error_message": f"{base_note['label']}为空，已跳过图文笔记。",
                 }
             )
 
@@ -3337,13 +3484,27 @@ P 数索引：
 
         status_value = str(context.get("status") or "partial")
         warnings = [str(item) for item in context.get("warnings", []) if str(item).strip()]
+        visual_note_path = Path(note_path).parent / "visual_note.md"
+        frame_index_path = Path(note_path).parent / "frame_index.json"
+        insert_plan_path = Path(note_path).parent / "visual_insert_plan.json"
+        note_mode = str(context.get("note_mode") or result.primary_note_mode or KNOWLEDGE_NOTE_MODE)
+        variant_artifacts: dict[str, str] = {}
+        if note_mode and note_mode != KNOWLEDGE_NOTE_MODE:
+            variant_artifacts = {
+                f"note_variant_{note_mode}_visual_enhanced_note_path": str(Path(note_path)),
+                f"note_variant_{note_mode}_visual_note_path": str(visual_note_path),
+                f"note_variant_{note_mode}_visual_context_path": str(Path(context_path)),
+                f"note_variant_{note_mode}_visual_frame_index_path": str(frame_index_path),
+                f"note_variant_{note_mode}_visual_insert_plan_path": str(insert_plan_path),
+            }
         artifacts = {
             **started_result.artifacts,
             "visual_enhanced_note_path": str(Path(note_path)),
-            "visual_note_path": str(Path(note_path).parent / "visual_note.md"),
+            "visual_note_path": str(visual_note_path),
             "visual_context_path": str(Path(context_path)),
-            "visual_frame_index_path": str(Path(note_path).parent / "frame_index.json"),
-            "visual_insert_plan_path": str(Path(note_path).parent / "visual_insert_plan.json"),
+            "visual_frame_index_path": str(frame_index_path),
+            "visual_insert_plan_path": str(insert_plan_path),
+            **variant_artifacts,
         }
         final_result = started_result.model_copy(
             update={
@@ -3351,7 +3512,7 @@ P 数索引：
                 "visual_note_mode": str(context.get("mode") or mode),
                 "visual_note_status": status_value,
                 "visual_note_error_message": "\n".join(warnings) if status_value in {"failed", "partial", "unsupported"} and warnings else None,
-                "visual_note_artifact_path": str(Path(note_path).parent / "visual_note.md"),
+                "visual_note_artifact_path": str(visual_note_path),
                 "visual_enhanced_note_artifact_path": str(Path(note_path)),
                 "visual_note_updated_at": datetime.now(timezone.utc),
                 "visual_frame_count": int(context.get("frame_count") or 0),
@@ -3376,6 +3537,34 @@ P 数索引：
 
     def _visual_note_mode(self, mode_override: str | None = None) -> str:
         return normalize_visual_note_mode(mode_override or self._settings.visual_note_mode or "text")
+
+    def _visual_base_note(self, result: TaskResult) -> dict[str, object]:
+        primary_mode = str(result.primary_note_mode or KNOWLEDGE_NOTE_MODE).strip() or KNOWLEDGE_NOTE_MODE
+        for mode in [primary_mode, KNOWLEDGE_NOTE_MODE, DETAILED_RECORD_MODE]:
+            if mode == KNOWLEDGE_NOTE_MODE and result.knowledge_note_markdown.strip():
+                definition = NOTE_MODE_REGISTRY.get(KNOWLEDGE_NOTE_MODE)
+                return {
+                    "mode": KNOWLEDGE_NOTE_MODE,
+                    "label": definition.label if definition else "知识笔记",
+                    "markdown": result.knowledge_note_markdown.strip(),
+                }
+            for variant in result.note_variants:
+                if variant.id != mode:
+                    continue
+                markdown = str(variant.markdown or "").strip()
+                if markdown:
+                    definition = NOTE_MODE_REGISTRY.get(mode)
+                    return {
+                        "mode": mode,
+                        "label": variant.label or (definition.label if definition else mode),
+                        "markdown": markdown,
+                    }
+        definition = NOTE_MODE_REGISTRY.get(primary_mode)
+        return {
+            "mode": primary_mode,
+            "label": definition.label if definition else primary_mode,
+            "markdown": "",
+        }
 
     def _build_visual_keyframe_plan(self, title: str, result: TaskResult, mode: str) -> dict[str, object]:
         fallback = self._build_visual_keyframe_plan_locally(result, mode)
@@ -3432,11 +3621,16 @@ P 数索引：
     def _build_visual_keyframe_plan_with_llm(self, title: str, result: TaskResult, mode: str) -> dict[str, object]:
         base_url = (self._settings.llm_base_url or "").rstrip("/")
         max_frames = max(1, min(int(self._settings.visual_evidence_max_frames or 12), 30))
+        base_note = self._visual_base_note(result)
+        base_note_markdown = str(base_note["markdown"])
         summary_payload = {
             "overview": result.overview,
             "keyPoints": result.key_points,
             "chapters": result.timeline,
             "chapterGroups": result.chapter_groups,
+            "visualNoteMode": mode,
+            "noteMode": base_note["mode"],
+            "noteLabel": base_note["label"],
         }
         segments_excerpt = _truncate_text(json.dumps(result.timeline, ensure_ascii=False), 6000)
         user_template = self._settings.visual_frame_planning_prompt.strip() or (
@@ -3454,14 +3648,14 @@ P 数索引：
                 mode=mode,
                 max_frames=max_frames,
                 summary_json=_truncate_text(json.dumps(summary_payload, ensure_ascii=False), 9000),
-                knowledge_note_markdown=_truncate_text(result.knowledge_note_markdown or "", 12000),
+                knowledge_note_markdown=_truncate_text(base_note_markdown, 12000),
                 segments_excerpt=segments_excerpt,
             )
         except (KeyError, IndexError, ValueError):
             user_prompt = (
                 f"{user_template}\n\n视频标题：{title}\n模式：{mode}\n摘要 JSON：\n"
                 f"{_truncate_text(json.dumps(summary_payload, ensure_ascii=False), 9000)}\n\n"
-                f"知识笔记：\n{_truncate_text(result.knowledge_note_markdown or '', 12000)}\n\n"
+                f"{base_note['label']}：\n{_truncate_text(base_note_markdown, 12000)}\n\n"
                 f"分段数据：\n{segments_excerpt}"
             )
         payload = {
@@ -4021,11 +4215,12 @@ P 数索引：
         *,
         title: str,
         result: TaskResult,
+        base_note_markdown: str | None = None,
         observations: list[dict[str, object]],
         insert_plan: dict[str, object],
         mode: str,
     ) -> str:
-        base_note = str(result.knowledge_note_markdown or "").strip()
+        base_note = str(base_note_markdown or self._visual_base_note(result)["markdown"] or "").strip()
         if not base_note:
             return ""
         if mode == "vlm_integrated" and observations and self._visual_llm_available():
@@ -4156,23 +4351,32 @@ P 数索引：
             return knowledge_note_markdown
         lines = knowledge_note_markdown.splitlines()
         output: list[str] = []
-        insertion_index = 0
+        used_indices: set[int] = set()
         for line in lines:
             stripped = line.strip()
             is_heading = stripped.startswith("#")
             output.append(line)
-            if insertion_index >= len(insertions):
-                continue
-            current = insertions[insertion_index]
-            anchor = str(current.get("anchor_heading") or current.get("chapter_title") or "").strip()
-            if not is_heading or not anchor:
+            if not is_heading:
                 continue
             heading_text = re.sub(r"^#+\s*", "", stripped).strip()
-            shorter, longer = sorted((len(anchor), len(heading_text)))
-            if (anchor in heading_text or heading_text in anchor) and shorter >= longer * 0.6:
+            for index, current in enumerate(insertions):
+                if index in used_indices:
+                    continue
+                anchor = str(current.get("anchor_heading") or current.get("chapter_title") or "").strip()
+                if not anchor or not self._visual_heading_matches(anchor, heading_text):
+                    continue
                 output.extend(self._format_visual_insertion_markdown(current))
-                insertion_index += 1
+                used_indices.add(index)
+        unmatched = [item for index, item in enumerate(insertions) if index not in used_indices]
+        if unmatched:
+            output.extend(["", "## 补充截图"])
+            for item in unmatched:
+                output.extend(self._format_visual_insertion_markdown(item))
         return "\n".join(output).strip()
+
+    def _visual_heading_matches(self, anchor: str, heading_text: str) -> bool:
+        shorter, longer = sorted((len(anchor), len(heading_text)))
+        return bool(longer and (anchor in heading_text or heading_text in anchor) and shorter >= longer * 0.6)
 
     def _format_visual_insertion_markdown(self, insertion: dict[str, object]) -> list[str]:
         image = str(insertion.get("markdown_image") or "").strip()
@@ -4223,6 +4427,8 @@ P 数索引：
         keyframe_plan_path: Path,
         insert_plan_path: Path,
         mode: str,
+        note_mode: str,
+        note_label: str,
         insert_count: int,
     ) -> dict[str, object]:
         return {
@@ -4230,6 +4436,8 @@ P 数索引：
             "task_id": task_id,
             "status": status,
             "source_kind": source_kind,
+            "note_mode": note_mode,
+            "note_label": note_label,
             "provider": "openai_compatible" if self._visual_llm_available() else "none",
             "model": self._visual_llm_config()[2] if self._visual_llm_available() else "",
             "visual_note_path": note_path.name,
@@ -5621,22 +5829,35 @@ P 数索引：
         transcript: str,
         segments: list[dict[str, object]],
         summary: dict[str, object],
+        note_modes: list[str] | None = None,
+        primary_note_mode: str | None = None,
     ) -> TaskResult:
         snapshot_result = self._export_transcript_snapshot(task_dir, title, transcript, segments)
         transcript_path = Path(snapshot_result.artifacts["transcript_path"])
         summary_path = Path(snapshot_result.artifacts["summary_path"])
         knowledge_note_path = task_dir / "knowledge_note.md"
         knowledge_note_markdown = str(summary.get("knowledgeNoteMarkdown") or "").strip()
-        summary_path.write_text(
-            json.dumps({"title": title, "summary": summary, "segments": segments}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
         knowledge_note_path.write_text(knowledge_note_markdown, encoding="utf-8")
         logger.info(
             "result exported transcript_path=%s summary_path=%s knowledge_note_path=%s",
             transcript_path,
             summary_path,
             knowledge_note_path,
+        )
+        normalized_modes = normalize_note_modes(note_modes)
+        primary_mode = normalize_primary_note_mode(normalized_modes, primary_note_mode)
+        note_variants, note_artifacts = self._export_note_variants(
+            task_dir=task_dir,
+            title=title,
+            transcript=transcript,
+            segments=segments,
+            summary=summary,
+            note_modes=normalized_modes,
+            knowledge_note_path=knowledge_note_path,
+        )
+        summary_path.write_text(
+            json.dumps({"title": title, "summary": summary, "segments": segments}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
         return self._build_task_result(
             transcript,
@@ -5646,8 +5867,98 @@ P 数索引：
                 "transcript_path": str(transcript_path),
                 "summary_path": str(summary_path),
                 "knowledge_note_path": str(knowledge_note_path),
+                **note_artifacts,
             },
+            note_variants=note_variants,
+            primary_note_mode=primary_mode,
         )
+
+    def _export_note_variants(
+        self,
+        *,
+        task_dir: Path,
+        title: str,
+        transcript: str,
+        segments: list[dict[str, object]],
+        summary: dict[str, object],
+        note_modes: list[str],
+        knowledge_note_path: Path,
+    ) -> tuple[list[NoteVariant], dict[str, str]]:
+        variants: list[NoteVariant] = []
+        artifacts: dict[str, str] = {}
+        knowledge_note_markdown = str(summary.get("knowledgeNoteMarkdown") or "").strip()
+        if KNOWLEDGE_NOTE_MODE in note_modes:
+            definition = note_mode_definition(KNOWLEDGE_NOTE_MODE)
+            variants.append(
+                NoteVariant(
+                    id=definition.id,
+                    label=definition.label,
+                    markdown=knowledge_note_markdown,
+                    artifact_path=str(knowledge_note_path),
+                    quality={"markdown_chars": len(knowledge_note_markdown)},
+                )
+            )
+            artifacts["note_variant_knowledge_note_path"] = str(knowledge_note_path)
+
+        if DETAILED_RECORD_MODE in note_modes:
+            definition = note_mode_definition(DETAILED_RECORD_MODE)
+            json_path = task_dir / "detailed_record.json"
+            markdown_path = task_dir / "detailed_record.md"
+            try:
+                if self._settings.llm_enabled and self._settings.llm_api_key:
+                    payload = self._generate_detailed_record_with_llm(transcript, segments, title, summary)
+                    record = normalize_detailed_record_payload(payload, title=title, summary=summary, segments=segments)
+                    summary["llm_prompt_tokens"] = (_safe_int(summary.get("llm_prompt_tokens")) or 0) + (
+                        _safe_int(payload.get("llm_prompt_tokens")) or 0
+                    )
+                    summary["llm_completion_tokens"] = (_safe_int(summary.get("llm_completion_tokens")) or 0) + (
+                        _safe_int(payload.get("llm_completion_tokens")) or 0
+                    )
+                    summary["llm_total_tokens"] = (_safe_int(summary.get("llm_total_tokens")) or 0) + (
+                        _safe_int(payload.get("llm_total_tokens")) or 0
+                    )
+                else:
+                    record = build_detailed_record_fallback(title=title, summary=summary, segments=segments)
+                markdown = render_detailed_record_markdown(record)
+                json_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+                markdown_path.write_text(markdown, encoding="utf-8")
+                variants.append(
+                    NoteVariant(
+                        id=definition.id,
+                        label=definition.label,
+                        markdown=markdown,
+                        artifact_path=str(markdown_path),
+                        structured_artifact_path=str(json_path),
+                        content_type="markdown+json",
+                        structured=record,
+                        quality=detailed_record_quality(record),
+                    )
+                )
+                artifacts["note_variant_detailed_record_path"] = str(markdown_path)
+                artifacts["note_variant_detailed_record_json_path"] = str(json_path)
+            except Exception as exc:
+                logger.warning("detailed record generation failed error=%s", exc)
+                fallback = build_detailed_record_fallback(title=title, summary=summary, segments=segments)
+                markdown = render_detailed_record_markdown(fallback)
+                json_path.write_text(json.dumps(fallback, ensure_ascii=False, indent=2), encoding="utf-8")
+                markdown_path.write_text(markdown, encoding="utf-8")
+                variants.append(
+                    NoteVariant(
+                        id=definition.id,
+                        label=definition.label,
+                        status="partial",
+                        markdown=markdown,
+                        artifact_path=str(markdown_path),
+                        structured_artifact_path=str(json_path),
+                        content_type="markdown+json",
+                        structured=fallback,
+                        error_message=str(exc),
+                        quality=detailed_record_quality(fallback),
+                    )
+                )
+                artifacts["note_variant_detailed_record_path"] = str(markdown_path)
+                artifacts["note_variant_detailed_record_json_path"] = str(json_path)
+        return variants, artifacts
 
     def _export_transcript_snapshot(
         self,
@@ -5679,6 +5990,8 @@ P 数索引：
         summary: dict[str, object],
         segments: list[dict[str, object]] | None = None,
         artifacts: dict[str, str] | None = None,
+        note_variants: list[NoteVariant] | None = None,
+        primary_note_mode: str = KNOWLEDGE_NOTE_MODE,
     ) -> TaskResult:
         knowledge_note_markdown = str(summary.get("knowledgeNoteMarkdown") or "").strip()
         result_artifacts = dict(artifacts or {})
@@ -5698,6 +6011,8 @@ P 数索引：
         return TaskResult(
             overview=str(summary.get("overview") or ""),
             knowledge_note_markdown=knowledge_note_markdown,
+            note_variants=note_variants or [],
+            primary_note_mode=str(primary_note_mode or KNOWLEDGE_NOTE_MODE),
             transcript_text=transcript,
             segments=segments or [],
             segment_summaries=[str(item["summary"]) for item in summary.get("chapters", [])],

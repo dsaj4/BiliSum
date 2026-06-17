@@ -3,6 +3,13 @@ from pathlib import Path
 import pytest
 
 from video_sum_core.models.tasks import InputType, TaskInput, TaskResult, TaskStatus
+from video_sum_core.note_modes import (
+    UnknownNoteModeError,
+    build_detailed_record_fallback,
+    normalize_detailed_record_payload,
+    normalize_note_modes,
+    render_detailed_record_markdown,
+)
 from video_sum_core.errors import VideoSumError
 from video_sum_core.pipeline.real import PipelineSettings, RealPipelineRunner
 from video_sum_core.pipeline.base import PipelineContext
@@ -21,6 +28,13 @@ def test_task_input_defaults() -> None:
 
     assert task_input.options.language == "zh"
     assert "json" in task_input.options.export_formats
+    assert task_input.options.note_modes == ["knowledge_note"]
+
+
+def test_note_modes_normalize_and_reject_unknown_values() -> None:
+    assert normalize_note_modes("knowledge-note,detailed-record") == ["knowledge_note", "detailed_record"]
+    with pytest.raises(UnknownNoteModeError):
+        normalize_note_modes(["missing_mode"])
 
 
 def test_task_status_values_stable() -> None:
@@ -345,6 +359,88 @@ def test_knowledge_note_payload_forces_json_keyword() -> None:
     assert "json" in contents.lower()
 
 
+def test_detailed_record_prompt_requests_faithful_transcript_sections() -> None:
+    runner = RealPipelineRunner(PipelineSettings(tasks_dir=Path(".")))
+
+    payload = runner._build_llm_detailed_record_payload(
+        "测试标题",
+        "[00:00] 我最近做了一个学习项目。",
+        '[{"index":1,"start":0,"end":5,"text":"我最近做了一个学习项目。"}]',
+        '{"overview":"概览"}',
+    )
+    contents = "\n".join(str(message.get("content") or "") for message in payload["messages"])
+
+    assert "sections" in contents
+    assert "microSegments" in contents
+    assert "不要总结" in contents
+    assert "不要把“我”改成“作者/UP 主”" in contents
+    assert "忠实保留原始材料的表达方式" in contents
+    assert "segments、transitions、compactSummary" not in contents
+
+
+def test_detailed_record_v2_normalizes_and_renders_transcript_micro_segments() -> None:
+    record = normalize_detailed_record_payload(
+        {
+            "title": "学习项目演示",
+            "sections": [
+                {
+                    "title": "开场",
+                    "start": 0,
+                    "end": 18,
+                    "sourceSegmentIds": [1, 2],
+                    "microSegments": [
+                        {
+                            "start": 0,
+                            "end": 8,
+                            "text": "我最近做了一个帮助自己学习的项目，这个项目对我的学习帮助很大。",
+                            "sourceSegmentIds": [1],
+                            "visualRefs": [],
+                        },
+                        {
+                            "start": 8,
+                            "end": 18,
+                            "text": "所以我想把这个系统的思路和使用方式简单讲一下。",
+                            "sourceSegmentIds": [2],
+                            "visualRefs": [],
+                        },
+                    ],
+                }
+            ],
+            "timeline": [{"start": 0, "end": 18, "title": "开场"}],
+        },
+        title="学习项目演示",
+        summary={"overview": "不要出现在正文"},
+        segments=[],
+    )
+
+    markdown = render_detailed_record_markdown(record)
+
+    assert record["version"] == 2
+    assert record["style"] == "discourse_aligned_transcript"
+    assert "sections" in record
+    assert "我最近做了一个帮助自己学习的项目" in markdown
+    assert "作者" not in markdown
+    assert "## 逐句实录" in markdown
+    assert "**1.1 00:00 - 00:08**" in markdown
+
+
+def test_detailed_record_fallback_uses_source_segments_instead_of_summary() -> None:
+    record = build_detailed_record_fallback(
+        title="学习项目演示",
+        summary={"overview": "这里是总结", "chapters": [{"title": "开场", "start": 0.0, "summary": "作者介绍项目"}]},
+        segments=[
+            {"id": 1, "start": 0.0, "end": 5.0, "text": "我最近做了一个帮助自己学习的项目。"},
+            {"id": 2, "start": 5.0, "end": 10.0, "text": "这个项目对我的学习帮助很大。"},
+        ],
+    )
+    markdown = render_detailed_record_markdown(record)
+
+    assert record["version"] == 2
+    assert "我最近做了一个帮助自己学习的项目" in markdown
+    assert "这个项目对我的学习帮助很大" in markdown
+    assert "作者介绍项目" not in markdown
+
+
 def test_aggregate_series_note_prompt_uses_page_positioning() -> None:
     runner = RealPipelineRunner(PipelineSettings(tasks_dir=Path(".")))
 
@@ -412,6 +508,85 @@ def test_export_result_preserves_llm_usage(tmp_path: Path) -> None:
     assert result.artifacts["llm_model"] == "deepseek-test"
     assert result.artifacts["subtitle_provider"] == "ai-zh"
     assert "transcript_source_json" in result.artifacts
+
+
+def test_export_result_writes_detailed_record_variant(tmp_path: Path) -> None:
+    runner = RealPipelineRunner(PipelineSettings(tasks_dir=Path("."), llm_enabled=False))
+    task_dir = tmp_path / "tmp_export_detailed_record"
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    result = runner._export_result(
+        task_dir=task_dir,
+        title="细粒度笔记",
+        transcript="[00:00] 开场\n[00:10] 展开观点",
+        segments=[
+            {"start": 0.0, "end": 8.0, "text": "开场说明主题"},
+            {"start": 10.0, "end": 18.0, "text": "展开核心观点"},
+        ],
+        summary={
+            "overview": "概述",
+            "bulletPoints": ["要点一"],
+            "chapters": [{"title": "开场", "start": 0.0, "summary": "说明主题"}],
+            "knowledgeNoteMarkdown": "# 知识笔记",
+        },
+        note_modes=["knowledge_note", "detailed_record"],
+        primary_note_mode="detailed_record",
+    )
+
+    assert result.primary_note_mode == "detailed_record"
+    assert {variant.id for variant in result.note_variants} == {"knowledge_note", "detailed_record"}
+    detailed = next(variant for variant in result.note_variants if variant.id == "detailed_record")
+    assert detailed.structured_artifact_path is not None
+    assert detailed.artifact_path is not None
+    assert Path(detailed.structured_artifact_path).exists()
+    assert Path(detailed.artifact_path).exists()
+    assert result.artifacts["note_variant_detailed_record_json_path"].endswith("detailed_record.json")
+
+
+def test_visual_base_note_uses_primary_detailed_record_variant() -> None:
+    runner = RealPipelineRunner(PipelineSettings(tasks_dir=Path(".")))
+    result = TaskResult(
+        knowledge_note_markdown="# 知识笔记\n\n这是知识笔记。",
+        primary_note_mode="detailed_record",
+        note_variants=[
+            {
+                "id": "detailed_record",
+                "label": "逐句实录",
+                "markdown": "# 逐句实录\n\n我最近做了一个项目。",
+            }
+        ],
+    )
+
+    base_note = runner._visual_base_note(result)
+
+    assert base_note["mode"] == "detailed_record"
+    assert base_note["label"] == "逐句实录"
+    assert "我最近做了一个项目" in str(base_note["markdown"])
+
+
+def test_visual_context_records_note_mode(tmp_path: Path) -> None:
+    runner = RealPipelineRunner(PipelineSettings(tasks_dir=Path(".")))
+
+    context = runner._build_visual_context_payload(
+        task_id="task-1",
+        status="ready",
+        source_kind="video",
+        frames=[],
+        observations=[],
+        warnings=[],
+        note_path=tmp_path / "visual_note.md",
+        enhanced_note_path=tmp_path / "visual_enhanced_note.md",
+        frame_index_path=tmp_path / "frame_index.json",
+        keyframe_plan_path=tmp_path / "visual_keyframe_plan.json",
+        insert_plan_path=tmp_path / "visual_insert_plan.json",
+        mode="frame_insert",
+        note_mode="detailed_record",
+        note_label="逐句实录",
+        insert_count=1,
+    )
+
+    assert context["note_mode"] == "detailed_record"
+    assert context["note_label"] == "逐句实录"
 
 
 def test_real_pipeline_normalizes_mindmap_payload_and_repairs_leaf_time() -> None:

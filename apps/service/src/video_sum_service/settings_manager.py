@@ -87,6 +87,8 @@ class SettingsUpdatePayload(BaseModel):
     llm_enabled: bool | None = None
     auto_generate_mindmap: bool | None = None
     visual_note_mode: str | None = None
+    note_modes: list[str] | None = None
+    primary_note_mode: str | None = None
     visual_evidence_enabled: bool | None = None
     visual_multimodal_enabled: bool | None = None
     visual_download_resolution: str | None = None

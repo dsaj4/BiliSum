@@ -1,7 +1,9 @@
 from datetime import datetime
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from video_sum_core.note_modes import normalize_note_modes
 
 
 class InputType(str, Enum):
@@ -26,6 +28,34 @@ class TaskOptions(BaseModel):
     prefer_subtitles: bool = True
     export_formats: list[str] = Field(default_factory=lambda: ["md", "json"])
     visual_note_mode: str | None = None
+    note_modes: list[str] = Field(default_factory=lambda: ["knowledge_note"])
+    primary_note_mode: str | None = None
+
+    @field_validator("note_modes", mode="before")
+    @classmethod
+    def _normalize_note_modes(cls, value: object) -> list[str]:
+        return normalize_note_modes(value)
+
+    @field_validator("primary_note_mode")
+    @classmethod
+    def _normalize_primary_note_mode(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = normalize_note_modes([value])
+        return normalized[0] if normalized else None
+
+
+class NoteVariant(BaseModel):
+    id: str
+    label: str
+    status: str = "ready"
+    markdown: str = ""
+    artifact_path: str | None = None
+    structured_artifact_path: str | None = None
+    content_type: str = "markdown"
+    structured: dict[str, object] | None = None
+    error_message: str | None = None
+    quality: dict[str, object] = Field(default_factory=dict)
 
 
 class TaskInput(BaseModel):
@@ -39,6 +69,8 @@ class TaskInput(BaseModel):
 class TaskResult(BaseModel):
     overview: str = ""
     knowledge_note_markdown: str = ""
+    note_variants: list[NoteVariant] = Field(default_factory=list)
+    primary_note_mode: str = "knowledge_note"
     transcript_text: str = ""
     segments: list[dict[str, object]] = Field(default_factory=list)
     segment_summaries: list[str] = Field(default_factory=list)

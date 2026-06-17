@@ -357,6 +357,8 @@ export const api = {
       page_number?: number | null;
       visual_note_mode?: string | null;
       prompt_preset_id?: string | null;
+      note_modes?: string[] | null;
+      primary_note_mode?: string | null;
     },
   ) {
     return fetchJson<TaskDetail>(`/api/v1/videos/${videoId}/tasks`, {

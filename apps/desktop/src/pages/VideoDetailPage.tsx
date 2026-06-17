@@ -23,13 +23,15 @@ import {
   getTaskPageNumber,
   isAggregateSummaryTask,
   pickDetailTaskId,
+  resolveNoteVariants,
+  resolvePrimaryNoteVariant,
   resolveKnowledgeNoteMarkdown,
   taskPageLabel,
   type DetailTab,
   type KnowledgeCard,
   type TaskPanelState,
 } from "../detailModel";
-import type { MindMapNode, TaskDetail, TaskEvent, TaskMarkdownExportResponse, TaskMindMapResponse, TaskStatus, TaskSummary, TaskVisualEvidenceResponse, VideoAssetDetail, VideoPageBatchOption, VideoTaskBatchResponse, VisualEvidenceFrame, VisualEvidenceObservation } from "../types";
+import type { MindMapNode, NoteVariant, TaskDetail, TaskEvent, TaskMarkdownExportResponse, TaskMindMapResponse, TaskResult, TaskStatus, TaskSummary, TaskVisualEvidenceResponse, VideoAssetDetail, VideoPageBatchOption, VideoTaskBatchResponse, VisualEvidenceFrame, VisualEvidenceObservation } from "../types";
 import { formatDateTime, formatDuration, formatTaskDuration, formatTokenCount, sanitizeMindMapLabel, summarizeEvents, taskStatusLabel } from "../utils";
 import { buildPlayerEmbedDescriptor, withPlayerSeek } from "../videoPlayer";
 
@@ -122,6 +124,15 @@ type FloatingPlayerLayout = {
 
 type KnowledgeNoteViewMode = "text" | "visual";
 
+type WorkspaceItem =
+  | { id: "knowledge"; tab: "knowledge"; label: string; description: string }
+  | { id: `note:${string}`; tab: "summary"; label: string; description: string; variant: NoteVariant }
+  | { id: "mindmap"; tab: "mindmap"; label: string; description: string };
+
+function isNoteWorkspaceItem(item: WorkspaceItem): item is Extract<WorkspaceItem, { tab: "summary" }> {
+  return item.tab === "summary";
+}
+
 const MINDMAP_ROOT_ACCENT: MindMapAccent = {
   stroke: "#4c9fdd",
   surface: "rgba(76, 159, 221, 0.18)",
@@ -147,11 +158,47 @@ const FLOATING_PLAYER_CHROME_HEIGHT = 62;
 const LOCAL_VIDEO_SUFFIXES = new Set([".mp4", ".mov", ".mkv", ".avi", ".wmv", ".webm", ".flv", ".m4v", ".ts", ".mpeg", ".mpg"]);
 const SUMMARY_PREFERENCE_STORAGE_KEY = "bilisum.summaryPreference";
 
-const detailTabs: Array<{ id: DetailTab; label: string; description: string }> = [
-  { id: "knowledge", label: "知识卡片", description: "按概览、要点、章节整理当前任务结果。" },
-  { id: "summary", label: "知识笔记", description: "查看当前任务的完整笔记、重点展开和转写全文。" },
-  { id: "mindmap", label: "思维导图", description: "预留按主题组织的知识结构视图入口。" },
-];
+function mergeTaskResult(existing: TaskResult | null | undefined, incoming: TaskResult | null | undefined): TaskResult | null | undefined {
+  if (incoming === undefined) {
+    return existing;
+  }
+  if (incoming === null || !existing) {
+    return incoming;
+  }
+  return {
+    ...existing,
+    ...incoming,
+    knowledge_note_markdown: incoming.knowledge_note_markdown?.trim() ? incoming.knowledge_note_markdown : existing.knowledge_note_markdown,
+    note_variants: incoming.note_variants?.length ? incoming.note_variants : existing.note_variants,
+    primary_note_mode: incoming.primary_note_mode ?? existing.primary_note_mode,
+    transcript_text: incoming.transcript_text?.trim() ? incoming.transcript_text : existing.transcript_text,
+    segments: incoming.segments?.length ? incoming.segments : existing.segments,
+    segment_summaries: incoming.segment_summaries?.length ? incoming.segment_summaries : existing.segment_summaries,
+    key_points: incoming.key_points?.length ? incoming.key_points : existing.key_points,
+    timeline: incoming.timeline?.length ? incoming.timeline : existing.timeline,
+    chapter_groups: incoming.chapter_groups?.length ? incoming.chapter_groups : existing.chapter_groups,
+    artifacts: {
+      ...(existing.artifacts ?? {}),
+      ...(incoming.artifacts ?? {}),
+    },
+  };
+}
+
+function noteVariantDescription(variant: NoteVariant): string {
+  if (variant.status === "failed") {
+    return variant.error_message || "该笔记模式生成失败，可查看错误信息。";
+  }
+  if (variant.id === "detailed_record") {
+    return "按微段展开的结构化 JSON + Markdown 记录。";
+  }
+  if (variant.id === "knowledge_note") {
+    return "完整学习笔记，支持纯文本、图文和导出。";
+  }
+  if (variant.content_type === "markdown+json") {
+    return "结构化 JSON + Markdown 笔记产物。";
+  }
+  return "Markdown 笔记产物。";
+}
 
 function compareTasksByRecent(left: TaskSummary, right: TaskSummary) {
   const updatedAtDelta = new Date(right.updated_at).getTime() - new Date(left.updated_at).getTime();
@@ -355,6 +402,7 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
   const [visualEvidence, setVisualEvidence] = useState<Record<string, TaskVisualEvidenceResponse>>({});
   const [visualEvidenceLoading, setVisualEvidenceLoading] = useState<Record<string, boolean>>({});
   const [knowledgeNoteViewMode, setKnowledgeNoteViewMode] = useState<KnowledgeNoteViewMode>(() => loadKnowledgeNoteViewMode());
+  const [selectedNoteVariantId, setSelectedNoteVariantId] = useState<string | null>(null);
   const [knowledgeNoteModeMenuOpen, setKnowledgeNoteModeMenuOpen] = useState(false);
   const [isExportingKnowledgeCard, setIsExportingKnowledgeCard] = useState(false);
   const [isExportingKnowledgeNote, setIsExportingKnowledgeNote] = useState(false);
@@ -846,13 +894,14 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
         const nextEvents = existingContext.events.some((item) => item.event_id === payload.event.event_id)
           ? existingContext.events
           : [...existingContext.events, payload.event];
+        const nextResult = mergeTaskResult(existingContext.detail.result, payload.result);
         const nextContext = {
           detail: {
             ...existingContext.detail,
             status: payload.status,
             updated_at: payload.updated_at,
-            result: payload.result === undefined ? existingContext.detail.result : payload.result,
-            llm_total_tokens: payload.result?.llm_total_tokens ?? existingContext.detail.llm_total_tokens,
+            result: nextResult,
+            llm_total_tokens: nextResult?.llm_total_tokens ?? existingContext.detail.llm_total_tokens,
           },
           events: nextEvents,
         };
@@ -873,7 +922,7 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
         ...current,
         latest_status: payload.status,
         updated_at: payload.updated_at,
-        latest_result: payload.result === undefined ? current.latest_result : payload.result,
+        latest_result: mergeTaskResult(current.latest_result, payload.result),
       } : current);
     });
     source.onerror = () => source.close();
@@ -1150,21 +1199,79 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
   );
   const areAllChapterGroupsExpanded = chapterGroups.length > 0 && expandedChapterGroupIds.length === chapterGroups.length;
   const selectedKnowledgeNoteMarkdown = useMemo(() => resolveKnowledgeNoteMarkdown(selectedResult), [selectedResult]);
+  const noteVariants = useMemo(() => resolveNoteVariants(selectedResult), [selectedResult]);
+  const primaryNoteVariant = useMemo(() => resolvePrimaryNoteVariant(selectedResult), [selectedResult]);
+  const selectedNoteVariant = noteVariants.find((item) => item.id === selectedNoteVariantId) ?? primaryNoteVariant ?? noteVariants[0] ?? null;
+  const hasMultipleNoteVariants = noteVariants.length > 1;
   const selectedVisualEvidence = selectedTaskId ? visualEvidence[selectedTaskId] ?? null : null;
   const selectedVisualEvidenceStatus = selectedVisualEvidence?.status || selectedTaskDetail?.result?.visual_note_status || "idle";
   const selectedEnhancedNoteMarkdown = selectedVisualEvidence?.enhanced_note_markdown || selectedVisualEvidence?.visual_note_markdown || "";
-  const hasEnhancedKnowledgeNote = Boolean(selectedEnhancedNoteMarkdown.trim());
-  const effectiveKnowledgeNoteViewMode: KnowledgeNoteViewMode = knowledgeNoteViewMode === "visual" && hasEnhancedKnowledgeNote ? "visual" : "text";
+  const selectedNoteModeId = selectedNoteVariant?.id || "knowledge_note";
+  const visualEvidenceNoteMode = String(selectedVisualEvidence?.context?.note_mode || selectedTaskDetail?.result?.primary_note_mode || "knowledge_note");
+  const visualEvidenceMatchesSelectedNote = visualEvidenceNoteMode === selectedNoteModeId;
+  const hasEnhancedSelectedNote = visualEvidenceMatchesSelectedNote && Boolean(selectedEnhancedNoteMarkdown.trim());
+  const showVisualNoteMenuItem = hasEnhancedSelectedNote || (visualEvidenceMatchesSelectedNote && selectedVisualEvidenceStatus === "generating");
+  const effectiveKnowledgeNoteViewMode: KnowledgeNoteViewMode = knowledgeNoteViewMode === "visual" && hasEnhancedSelectedNote ? "visual" : "text";
 
   useEffect(() => {
-    if (!hasEnhancedKnowledgeNote && knowledgeNoteViewMode === "visual") {
+    if (!hasEnhancedSelectedNote && knowledgeNoteViewMode === "visual") {
       setKnowledgeNoteViewMode("text");
     }
-  }, [hasEnhancedKnowledgeNote, knowledgeNoteViewMode]);
+  }, [hasEnhancedSelectedNote, knowledgeNoteViewMode]);
+  useEffect(() => {
+    if (!selectedResult) {
+      setSelectedNoteVariantId(null);
+      return;
+    }
+    const nextPrimary = resolvePrimaryNoteVariant(selectedResult);
+    setSelectedNoteVariantId((current) => {
+      if (current && resolveNoteVariants(selectedResult).some((item) => item.id === current)) {
+        return current;
+      }
+      return nextPrimary?.id ?? null;
+    });
+  }, [selectedResult]);
   const displayedKnowledgeNoteMarkdown = effectiveKnowledgeNoteViewMode === "visual"
     ? selectedEnhancedNoteMarkdown
-    : selectedKnowledgeNoteMarkdown;
-  const knowledgeNoteModeLabel = effectiveKnowledgeNoteViewMode === "visual" ? "图文" : "纯文本";
+    : selectedNoteVariant?.markdown || selectedKnowledgeNoteMarkdown;
+  const knowledgeNoteModeLabel = selectedNoteVariant
+    ? `${selectedNoteVariant.label} / ${effectiveKnowledgeNoteViewMode === "visual" ? "图文" : "纯文本"}`
+    : (effectiveKnowledgeNoteViewMode === "visual" ? "图文" : "纯文本");
+  const workspaceItems: WorkspaceItem[] = useMemo(() => [
+    {
+      id: "knowledge",
+      tab: "knowledge",
+      label: "知识卡片",
+      description: "按概览、要点、章节整理当前任务结果。",
+    },
+    ...(noteVariants.length
+      ? noteVariants.map((variant): WorkspaceItem => ({
+        id: `note:${variant.id}`,
+        tab: "summary",
+        label: variant.label || variant.id,
+        description: noteVariantDescription(variant),
+        variant,
+      }))
+      : [{
+        id: "note:knowledge_note",
+        tab: "summary",
+        label: "知识笔记",
+        description: "查看当前任务的完整笔记、重点展开和转写全文。",
+        variant: {
+          id: "knowledge_note",
+          label: "知识笔记",
+          status: "ready",
+          markdown: selectedKnowledgeNoteMarkdown,
+          content_type: "markdown",
+        },
+      } satisfies WorkspaceItem]),
+    {
+      id: "mindmap",
+      tab: "mindmap",
+      label: "思维导图",
+      description: "预留按主题组织的知识结构视图入口。",
+    },
+  ], [noteVariants, selectedKnowledgeNoteMarkdown]);
   const visualKnowledgeNoteUnavailableText = selectedVisualEvidenceStatus === "generating"
     ? "图文笔记生成中，完成后可选"
     : "当前任务没有图文笔记";
@@ -2371,22 +2478,32 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
             </div>
 
             <nav className="detail-tab-row" role="tablist" aria-label="详情工作台视图">
-              {detailTabs.map((tab) => (
-                <button
-                  key={tab.id}
-                  className={`detail-tab ${activeTab === tab.id ? "active" : ""}`}
-                  role="tab"
-                  type="button"
-                  aria-selected={activeTab === tab.id}
-                  onClick={() => setActiveTab(tab.id)}
-                >
-                  <div className="detail-tab-topline">
-                    <DetailTabIcon active={activeTab === tab.id} tab={tab.id} />
-                    <span>{tab.label}</span>
-                  </div>
-                  <small>{tab.description}</small>
-                </button>
-              ))}
+              {workspaceItems.map((item) => {
+                const isSelected = isNoteWorkspaceItem(item)
+                  ? activeTab === "summary" && selectedNoteVariant?.id === item.variant.id
+                  : activeTab === item.tab;
+                return (
+                  <button
+                    key={item.id}
+                    className={`detail-tab ${isSelected ? "active" : ""}`}
+                    role="tab"
+                    type="button"
+                    aria-selected={isSelected}
+                    onClick={() => {
+                      if (isNoteWorkspaceItem(item)) {
+                        setSelectedNoteVariantId(item.variant.id);
+                      }
+                      setActiveTab(item.tab);
+                    }}
+                  >
+                    <div className="detail-tab-topline">
+                      <DetailTabIcon active={isSelected} tab={item.tab} />
+                      <span>{item.label}</span>
+                    </div>
+                    <small>{item.description}</small>
+                  </button>
+                );
+              })}
             </nav>
 
             {activeTab === "knowledge" ? (
@@ -2577,14 +2694,36 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
                           </button>
                           {knowledgeNoteModeMenuOpen ? (
                             <div className="detail-section-popover detail-note-mode-popover" role="menu" aria-label="知识笔记显示形式">
+                              {hasMultipleNoteVariants ? noteVariants.map((variant) => (
+                                <button
+                                  key={variant.id}
+                                  className={`detail-section-menu-item detail-note-mode-option ${selectedNoteVariant?.id === variant.id ? "is-selected" : ""}`}
+                                  type="button"
+                                  role="menuitemradio"
+                                  aria-checked={selectedNoteVariant?.id === variant.id}
+                                  onClick={() => {
+                                    setSelectedNoteVariantId(variant.id);
+                                    setKnowledgeNoteModeMenuOpen(false);
+                                  }}
+                                >
+                                  <span className="detail-section-menu-item-icon" aria-hidden="true">
+                                    <IconFileText />
+                                  </span>
+                                  <span className="detail-section-menu-copy">
+                                    <strong>{variant.label || variant.id}</strong>
+                                    <small>{variant.status === "partial" ? "已生成兜底版本" : variant.content_type === "markdown+json" ? "结构化 JSON + Markdown" : "Markdown 笔记"}</small>
+                                  </span>
+                                </button>
+                              )) : null}
+                              {showVisualNoteMenuItem ? (
                               <button
                                 className={`detail-section-menu-item detail-note-mode-option ${effectiveKnowledgeNoteViewMode === "visual" ? "is-selected" : ""}`}
                                 type="button"
                                 role="menuitemradio"
                                 aria-checked={effectiveKnowledgeNoteViewMode === "visual"}
-                                disabled={!hasEnhancedKnowledgeNote}
+                                disabled={!hasEnhancedSelectedNote}
                                 onClick={() => {
-                                  if (!hasEnhancedKnowledgeNote) {
+                                  if (!hasEnhancedSelectedNote) {
                                     return;
                                   }
                                   setKnowledgeNoteViewMode("visual");
@@ -2596,9 +2735,10 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
                                 </span>
                                 <span className="detail-section-menu-copy">
                                   <strong>图文</strong>
-                                  <small>{hasEnhancedKnowledgeNote ? "显示带图片的整合笔记" : visualKnowledgeNoteUnavailableText}</small>
+                                  <small>{hasEnhancedSelectedNote ? "显示带图片的整合笔记" : visualKnowledgeNoteUnavailableText}</small>
                                 </span>
                               </button>
+                              ) : null}
                               <button
                                 className={`detail-section-menu-item detail-note-mode-option ${effectiveKnowledgeNoteViewMode === "text" ? "is-selected" : ""}`}
                                 type="button"
@@ -2677,7 +2817,10 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
                         ) : null}
                       </div>
                     </div>
-                    <h4 className="detail-section-title">知识笔记</h4>
+                    <h4 className="detail-section-title">{selectedNoteVariant?.label || "知识笔记"}</h4>
+                    {selectedNoteVariant?.error_message ? (
+                      <p className="detail-section-body detail-section-warning">{selectedNoteVariant.error_message}</p>
+                    ) : null}
                     {!knowledgeOutputDir && !window.desktop?.dialog ? (
                       <p className="detail-section-body">导出前请先在设置中填写输出目录，Markdown / Obsidian 笔记会写入该目录。</p>
                     ) : null}
@@ -2690,6 +2833,7 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
                     ) : (
                       <p className="detail-section-body">当前任务还没有生成知识笔记。</p>
                     )}
+                    {visualEvidenceMatchesSelectedNote ? (
                     <details className="detail-visual-assets-details detail-note-assets-details">
                       <summary>
                         <span>查看图片素材记录</span>
@@ -2703,6 +2847,7 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
                         onSeekToTimestamp={!isAggregateSummaryView && hasSeekablePlayer ? handleSeekToChapter : undefined}
                       />
                     </details>
+                    ) : null}
                   </section>
 
                   <section className="detail-content-section">

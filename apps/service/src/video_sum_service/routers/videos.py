@@ -7,6 +7,7 @@ from uuid import uuid4
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse
 from video_sum_core.models.tasks import InputType, TaskInput
+from video_sum_core.note_modes import UnknownNoteModeError, normalize_note_modes, normalize_primary_note_mode
 
 from video_sum_service.context import LOCAL_MEDIA_UPLOAD_DIR, logger, settings_manager
 from video_sum_service.repository import SqliteTaskRepository
@@ -281,6 +282,8 @@ def _create_video_task_record(
     page_number: int | None = None,
     visual_note_mode: str | None = None,
     prompt_preset_id: str | None = None,
+    note_modes: list[str] | None = None,
+    primary_note_mode: str | None = None,
 ):
     page = resolve_video_page(video, page_number)
     if video.pages and page_number is not None and page is None:
@@ -301,10 +304,28 @@ def _create_video_task_record(
     if str(video.platform or "").lower() == "local":
         input_type = infer_local_input_type(source_url)
     task_input = TaskInput(input_type=input_type, source=source_url, title=title, platform_hint=video.platform)
+    try:
+        task_input.options.note_modes = normalize_note_modes(settings_manager.current.note_modes)
+        task_input.options.primary_note_mode = normalize_primary_note_mode(
+            task_input.options.note_modes,
+            settings_manager.current.primary_note_mode,
+        )
+    except UnknownNoteModeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if visual_note_mode is not None:
         task_input.options.visual_note_mode = visual_note_mode
     if prompt_preset_id is not None:
         task_input.options.prompt_preset_id = prompt_preset_id
+    if note_modes is not None:
+        try:
+            task_input.options.note_modes = normalize_note_modes(note_modes)
+        except UnknownNoteModeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if primary_note_mode is not None:
+        try:
+            task_input.options.primary_note_mode = normalize_primary_note_mode(task_input.options.note_modes, primary_note_mode)
+        except UnknownNoteModeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     record = task_store.create_task(
         task_input,
         video_id=video.video_id,
@@ -717,6 +738,8 @@ def create_video_task(
         page_number=getattr(request_body, "page_number", None) if request_body else None,
         visual_note_mode=getattr(request_body, "visual_note_mode", None) if request_body else None,
         prompt_preset_id=getattr(request_body, "prompt_preset_id", None) if request_body else None,
+        note_modes=getattr(request_body, "note_modes", None) if request_body else None,
+        primary_note_mode=getattr(request_body, "primary_note_mode", None) if request_body else None,
     )
     return refreshed.to_detail()
 
@@ -846,6 +869,8 @@ def create_video_tasks_batch(video_id: str, body: VideoTaskBatchRequest, request
         skipped_pages.extend(conflict_pages)
 
     prompt_preset_id = getattr(body, "prompt_preset_id", None)
+    note_modes = getattr(body, "note_modes", None)
+    primary_note_mode = getattr(body, "primary_note_mode", None)
     for page_number in creatable_page_numbers:
         refreshed = _create_video_task_record(
             app_state=request.app.state,
@@ -853,6 +878,8 @@ def create_video_tasks_batch(video_id: str, body: VideoTaskBatchRequest, request
             video=video,
             page_number=page_number,
             prompt_preset_id=prompt_preset_id,
+            note_modes=note_modes,
+            primary_note_mode=primary_note_mode,
         )
         created_tasks.append(refreshed.to_detail())
 

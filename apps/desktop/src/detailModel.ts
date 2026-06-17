@@ -1,4 +1,4 @@
-import type { PageAggregateStatus, TaskDetail, TaskMindMapResponse, TaskResult, TaskSummary, TimelineItem, VideoPageBatchOption, VideoPageOption } from "./types";
+import type { NoteVariant, PageAggregateStatus, TaskDetail, TaskMindMapResponse, TaskResult, TaskSummary, TimelineItem, VideoPageBatchOption, VideoPageOption } from "./types";
 
 export type DetailTab = "knowledge" | "summary" | "mindmap";
 export type TaskPanelState = "collapsed" | "expanded";
@@ -429,6 +429,41 @@ export function resolveKnowledgeNoteMarkdown(result?: TaskResult | null): string
   }
 
   return sections.join("\n").trim();
+}
+
+export function resolveNoteVariants(result?: TaskResult | null): NoteVariant[] {
+  if (!result) {
+    return [];
+  }
+  const variants = Array.isArray(result.note_variants)
+    ? result.note_variants.filter((item): item is NoteVariant => Boolean(item && typeof item === "object" && item.id))
+    : [];
+  const hasKnowledgeNote = variants.some((item) => item.id === "knowledge_note");
+  const knowledgeNoteMarkdown = resolveKnowledgeNoteMarkdown(result);
+  if (hasKnowledgeNote || !knowledgeNoteMarkdown) {
+    return variants;
+  }
+  return [
+    {
+      id: "knowledge_note",
+      label: "知识笔记",
+      status: "ready",
+      markdown: knowledgeNoteMarkdown,
+      artifact_path: result.artifacts?.knowledge_note_path,
+      content_type: "markdown",
+      quality: { markdown_chars: knowledgeNoteMarkdown.length },
+    },
+    ...variants,
+  ];
+}
+
+export function resolvePrimaryNoteVariant(result?: TaskResult | null): NoteVariant | null {
+  const variants = resolveNoteVariants(result);
+  if (!variants.length) {
+    return null;
+  }
+  const primaryMode = result?.primary_note_mode || "knowledge_note";
+  return variants.find((item) => item.id === primaryMode) ?? variants[0];
 }
 
 export function canExportKnowledgeNote(task?: Pick<TaskDetail, "status" | "result"> | null): boolean {

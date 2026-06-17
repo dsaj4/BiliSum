@@ -2096,6 +2096,8 @@ def serialize_settings(
         "llm_enabled": current_settings.llm_enabled,
         "auto_generate_mindmap": current_settings.auto_generate_mindmap,
         "visual_note_mode": current_settings.visual_note_mode,
+        "note_modes": current_settings.note_modes,
+        "primary_note_mode": current_settings.primary_note_mode,
         "visual_evidence_enabled": current_settings.visual_evidence_enabled,
         "visual_multimodal_enabled": current_settings.visual_multimodal_enabled,
         "visual_download_resolution": current_settings.visual_download_resolution,

@@ -17,6 +17,20 @@ export type ChapterGroupItem = {
 export type TaskMindMapStatus = "idle" | "generating" | "ready" | "failed";
 export type TaskVisualEvidenceStatus = "idle" | "generating" | "ready" | "partial" | "failed" | "unsupported";
 export type VisualNoteMode = "text" | "frame_insert" | "vlm_integrated";
+export type NoteModeId = "knowledge_note" | "detailed_record" | string;
+
+export type NoteVariant = {
+  id: NoteModeId;
+  label: string;
+  status: "ready" | "partial" | "failed" | string;
+  markdown: string;
+  artifact_path?: string | null;
+  structured_artifact_path?: string | null;
+  content_type?: string;
+  structured?: Record<string, unknown> | null;
+  error_message?: string | null;
+  quality?: Record<string, unknown>;
+};
 
 export type MindMapNode = {
   id: string;
@@ -39,6 +53,8 @@ export type TaskMindMap = {
 export type TaskResult = {
   overview: string;
   knowledge_note_markdown?: string;
+  note_variants?: NoteVariant[];
+  primary_note_mode?: NoteModeId;
   transcript_text: string;
   segments?: Array<{ start: number; end: number; text: string }>;
   segment_summaries: string[];
@@ -199,6 +215,8 @@ export type VideoTaskBatchRequest = {
   page_numbers: number[];
   confirm?: boolean;
   prompt_preset_id?: string | null;
+  note_modes?: string[] | null;
+  primary_note_mode?: string | null;
 };
 
 export type VideoTaskBatchResponse = {
@@ -240,6 +258,8 @@ export type VisualEvidenceContext = {
   task_id?: string;
   status?: TaskVisualEvidenceStatus | string;
   source_kind?: string;
+  note_mode?: NoteModeId | string;
+  note_label?: string;
   provider?: string;
   model?: string;
   frame_count?: number;
@@ -413,6 +433,8 @@ export type ServiceSettings = {
   llm_enabled: boolean;
   auto_generate_mindmap: boolean;
   visual_note_mode: VisualNoteMode;
+  note_modes: string[];
+  primary_note_mode: string;
   visual_evidence_enabled: boolean;
   visual_multimodal_enabled: boolean;
   visual_download_resolution: string;

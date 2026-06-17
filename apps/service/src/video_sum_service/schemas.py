@@ -20,12 +20,16 @@ class VideoTaskCreateRequest(BaseModel):
     page_number: int | None = None
     visual_note_mode: str | None = None
     prompt_preset_id: str | None = None
+    note_modes: list[str] | None = None
+    primary_note_mode: str | None = None
 
 
 class VideoTaskBatchRequest(BaseModel):
     page_numbers: list[int] = Field(default_factory=list)
     confirm: bool = False
     prompt_preset_id: str | None = None
+    note_modes: list[str] | None = None
+    primary_note_mode: str | None = None
 
 
 class AggregateSummaryRequest(BaseModel):

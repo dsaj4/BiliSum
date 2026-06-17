@@ -480,19 +480,33 @@ class TaskWorker:
                 return
             status_value = str(context.get("status") or "partial")
             error_message = "\n".join(str(item) for item in context.get("warnings", []) if str(item).strip()) or None
+            visual_note_path = Path(note_path).parent / "visual_note.md"
+            frame_index_path = Path(note_path).parent / "frame_index.json"
+            insert_plan_path = Path(note_path).parent / "visual_insert_plan.json"
+            note_mode = str(context.get("note_mode") or refreshed.result.primary_note_mode or "knowledge_note")
+            variant_artifacts: dict[str, str] = {}
+            if note_mode and note_mode != "knowledge_note":
+                variant_artifacts = {
+                    f"note_variant_{note_mode}_visual_enhanced_note_path": str(Path(note_path)),
+                    f"note_variant_{note_mode}_visual_note_path": str(visual_note_path),
+                    f"note_variant_{note_mode}_visual_context_path": str(Path(context_path)),
+                    f"note_variant_{note_mode}_visual_frame_index_path": str(frame_index_path),
+                    f"note_variant_{note_mode}_visual_insert_plan_path": str(insert_plan_path),
+                }
             final_result = refreshed.result.model_copy(
                 update={
                     "artifacts": {
                         **refreshed.result.artifacts,
                         "visual_enhanced_note_path": str(Path(note_path)),
-                        "visual_note_path": str(Path(note_path).parent / "visual_note.md"),
+                        "visual_note_path": str(visual_note_path),
                         "visual_context_path": str(Path(context_path)),
-                        "visual_frame_index_path": str(Path(note_path).parent / "frame_index.json"),
-                        "visual_insert_plan_path": str(Path(note_path).parent / "visual_insert_plan.json"),
+                        "visual_frame_index_path": str(frame_index_path),
+                        "visual_insert_plan_path": str(insert_plan_path),
+                        **variant_artifacts,
                     },
                     "visual_note_status": status_value,
                     "visual_note_error_message": error_message if status_value in {"failed", "partial", "unsupported"} else None,
-                    "visual_note_artifact_path": str(Path(note_path).parent / "visual_note.md"),
+                    "visual_note_artifact_path": str(visual_note_path),
                     "visual_enhanced_note_artifact_path": str(Path(note_path)),
                     "visual_note_updated_at": datetime.now(timezone.utc),
                     "visual_note_mode": str(context.get("mode") or normalized_mode),

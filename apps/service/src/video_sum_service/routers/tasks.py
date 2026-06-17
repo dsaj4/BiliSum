@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import FileResponse, StreamingResponse
 
 from video_sum_core.models.tasks import InputType, TaskStatus
+from video_sum_core.note_modes import UnknownNoteModeError, normalize_note_modes, normalize_primary_note_mode
 from video_sum_core.utils import normalize_video_url
 from video_sum_infra.config import normalize_visual_note_mode
 
@@ -42,6 +43,19 @@ router = APIRouter(prefix="/api/v1/tasks")
 @router.post("", response_model=TaskDetailResponse, status_code=status.HTTP_201_CREATED)
 def create_task(body: TaskCreateRequest, request: Request) -> TaskDetailResponse:
     task_store: SqliteTaskRepository = request.app.state.task_repository
+    if "note_modes" not in body.options.model_fields_set:
+        try:
+            body.options.note_modes = normalize_note_modes(settings_manager.current.note_modes)
+        except UnknownNoteModeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if "primary_note_mode" not in body.options.model_fields_set:
+        try:
+            body.options.primary_note_mode = normalize_primary_note_mode(
+                body.options.note_modes,
+                settings_manager.current.primary_note_mode,
+            )
+        except UnknownNoteModeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     video_id = body.video_id
     if video_id is None and body.input_type is InputType.URL:
