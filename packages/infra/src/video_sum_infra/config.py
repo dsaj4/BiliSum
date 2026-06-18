@@ -621,6 +621,14 @@ class ServiceSettings(BaseSettings):
     mindmap_concurrency: int = 1
     summary_chunk_concurrency: int = 2
     summary_chunk_retry_count: int = 2
+    detailed_record_micro_min_chars: int = 180
+    detailed_record_micro_target_chars: int = 360
+    detailed_record_micro_max_chars: int = 700
+    detailed_record_micro_max_duration_seconds: int = 120
+    detailed_record_llm_polish_enabled: bool = False
+    detailed_record_llm_polish_max_chars: int = 900
+    detailed_record_llm_polish_concurrency: int = 2
+    detailed_record_llm_polish_retry_count: int = 1
     ytdlp_cookies_file: str = ""
     ytdlp_cookies_browser: str = ""
 
@@ -670,7 +678,26 @@ class ServiceSettings(BaseSettings):
     def _normalize_knowledge_index_auto_rebuild(cls, value: str | None) -> str:
         return normalize_knowledge_index_auto_rebuild(value)
 
-    @field_validator("summary_chunk_overlap_segments", "task_concurrency", "mindmap_concurrency", "summary_chunk_concurrency", "summary_chunk_retry_count", "visual_evidence_max_frames", "visual_evidence_frame_interval_seconds", "visual_evidence_frame_width", "visual_evidence_timeout_seconds", "visual_evidence_retry_count", mode="before")
+    @field_validator(
+        "summary_chunk_overlap_segments",
+        "task_concurrency",
+        "mindmap_concurrency",
+        "summary_chunk_concurrency",
+        "summary_chunk_retry_count",
+        "visual_evidence_max_frames",
+        "visual_evidence_frame_interval_seconds",
+        "visual_evidence_frame_width",
+        "visual_evidence_timeout_seconds",
+        "visual_evidence_retry_count",
+        "detailed_record_micro_min_chars",
+        "detailed_record_micro_target_chars",
+        "detailed_record_micro_max_chars",
+        "detailed_record_micro_max_duration_seconds",
+        "detailed_record_llm_polish_max_chars",
+        "detailed_record_llm_polish_concurrency",
+        "detailed_record_llm_polish_retry_count",
+        mode="before",
+    )
     @classmethod
     def _coerce_positive_int(cls, value: int | str | None) -> int:
         parsed = int(value or 1)

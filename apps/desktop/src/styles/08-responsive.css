@@ -703,6 +703,17 @@
     justify-content: center;
   }
 
+  .detail-note-with-timeline {
+    grid-template-columns: 1fr;
+  }
+
+  .detail-record-timeline-panel,
+  .detail-record-timeline-panel:not(.is-open) {
+    position: static;
+    width: 100%;
+    justify-self: stretch;
+  }
+
   .detail-task-panel {
     padding: 20px;
   }

@@ -4,11 +4,14 @@ import pytest
 
 from video_sum_core.models.tasks import InputType, TaskInput, TaskResult, TaskStatus
 from video_sum_core.note_modes import (
+    DetailedRecordFormatterConfig,
     UnknownNoteModeError,
+    build_detailed_record_from_segments,
     build_detailed_record_fallback,
     normalize_detailed_record_payload,
     normalize_note_modes,
     render_detailed_record_markdown,
+    validate_detailed_record_micro_polish,
 )
 from video_sum_core.errors import VideoSumError
 from video_sum_core.pipeline.real import PipelineSettings, RealPipelineRunner
@@ -21,6 +24,19 @@ from video_sum_infra.config import (
 )
 from video_sum_infra.runtime import default_data_dir
 from video_sum_service.settings_manager import SettingsManager, SettingsUpdatePayload
+
+
+def _detailed_record_text_for_segments(segments: list[dict[str, object]]) -> str:
+    record = build_detailed_record_from_segments(
+        title="逐句实录清洗测试",
+        summary={"chapters": [{"title": "测试", "start": 0.0, "summary": "测试"}]},
+        segments=segments,
+    )
+    return "\n".join(
+        str(micro.get("text") or "")
+        for section in record["sections"]
+        for micro in section["microSegments"]
+    )
 
 
 def test_task_input_defaults() -> None:
@@ -378,6 +394,36 @@ def test_detailed_record_prompt_requests_faithful_transcript_sections() -> None:
     assert "segments、transitions、compactSummary" not in contents
 
 
+def test_detailed_record_micro_polish_payload_uses_single_micro_segment() -> None:
+    runner = RealPipelineRunner(PipelineSettings(tasks_dir=Path("."), llm_model="test-model"))
+
+    payload = runner._build_llm_detailed_record_micro_polish_payload(
+        title="测试标题",
+        section_title="检索功能",
+        micro_segment={
+            "id": "m1",
+            "start": 10,
+            "end": 30,
+            "text": "这个检索是呃输入关键词之后去匹配卡片。",
+            "sourceSegmentIds": [1, 2],
+        },
+        source_segments=[
+            {"id": 1, "start": 10, "end": 15, "text": "这个检索是呃输入关键词之后"},
+            {"id": 2, "start": 15, "end": 30, "text": "去匹配卡片。"},
+        ],
+    )
+    contents = "\n".join(str(message.get("content") or "") for message in payload["messages"])
+
+    assert payload["model"] == "test-model"
+    assert "json" in contents.lower()
+    assert "不是总结" in contents
+    assert "不要写“作者认为”" in contents
+    assert "sourceSegmentIds 必须与输入 microSegment.sourceSegmentIds 完全一致" in contents
+    assert "这个检索是呃输入关键词之后去匹配卡片" in contents
+    assert "[...中间转写已省略...]" not in contents
+    assert "转写节选" not in contents
+
+
 def test_detailed_record_v2_normalizes_and_renders_transcript_micro_segments() -> None:
     record = normalize_detailed_record_payload(
         {
@@ -422,6 +468,7 @@ def test_detailed_record_v2_normalizes_and_renders_transcript_micro_segments() -
     assert "作者" not in markdown
     assert "## 逐句实录" in markdown
     assert "**1.1 00:00 - 00:08**" in markdown
+    assert "### 时间轴" not in markdown
 
 
 def test_detailed_record_fallback_uses_source_segments_instead_of_summary() -> None:
@@ -439,6 +486,341 @@ def test_detailed_record_fallback_uses_source_segments_instead_of_summary() -> N
     assert "我最近做了一个帮助自己学习的项目" in markdown
     assert "这个项目对我的学习帮助很大" in markdown
     assert "作者介绍项目" not in markdown
+
+
+def test_detailed_record_cleanup_removes_sentence_initial_fillers() -> None:
+    text = _detailed_record_text_for_segments(
+        [
+            {"id": 1, "start": 0.0, "end": 3.0, "text": "呃，这个功能可以先这样理解。"},
+            {"id": 2, "start": 3.0, "end": 6.0, "text": "嗯 然后我们进入下一步。"},
+        ]
+    )
+
+    assert "呃" not in text
+    assert "嗯 然后" not in text
+    assert "这个功能可以先这样理解" in text
+    assert "然后我们进入下一步" in text
+
+
+def test_detailed_record_cleanup_removes_mid_sentence_oral_fillers() -> None:
+    text = _detailed_record_text_for_segments(
+        [
+            {"id": 1, "start": 0.0, "end": 4.0, "text": "这个检索是呃输入关键词之后去匹配卡片。"},
+            {"id": 2, "start": 4.0, "end": 8.0, "text": "那在这里啊我做成了一个让AI帮我决策。"},
+            {"id": 3, "start": 8.0, "end": 12.0, "text": "我可以按照啊核心组件来拆分。"},
+            {"id": 4, "start": 12.0, "end": 16.0, "text": "在拆分之余啊再给大家看一下检索功能。"},
+        ]
+    )
+
+    assert "是呃输入" not in text
+    assert "这里啊我" not in text
+    assert "按照啊核心" not in text
+    assert "之余啊再" not in text
+    assert "这个检索是输入关键词之后去匹配卡片" in text
+    assert "那在这里我做成了一个让AI帮我决策" in text
+    assert "按照核心组件来拆分" in text
+    assert "在拆分之余再给大家看一下检索功能" in text
+
+
+def test_detailed_record_cleanup_collapses_repeated_connectors() -> None:
+    text = _detailed_record_text_for_segments(
+        [
+            {"id": 1, "start": 0.0, "end": 4.0, "text": "然后然后我们继续看这个这个功能。"},
+            {"id": 2, "start": 4.0, "end": 8.0, "text": "就是就是这个流程的核心。"},
+        ]
+    )
+
+    assert "然后然后" not in text
+    assert "这个这个" not in text
+    assert "就是就是" not in text
+    assert "然后我们继续看这个功能" in text
+    assert "就是这个流程的核心" in text
+
+
+def test_detailed_record_cleanup_preserves_meaningful_chinese_text() -> None:
+    text = _detailed_record_text_for_segments(
+        [
+            {"id": 1, "start": 0.0, "end": 4.0, "text": "这个案例说明检索入口和卡片摘要之间的关系。"},
+            {"id": 2, "start": 4.0, "end": 8.0, "text": "如果拆分粒度太细，阅读时反而会被打断。"},
+        ]
+    )
+
+    assert "这个案例说明检索入口和卡片摘要之间的关系" in text
+    assert "如果拆分粒度太细，阅读时反而会被打断" in text
+
+
+def test_detailed_record_cleanup_repairs_obvious_asr_particles() -> None:
+    text = _detailed_record_text_for_segments(
+        [
+            {"id": 1, "start": 0.0, "end": 4.0, "text": "让我更加快速一呃的进入心流状态。"},
+        ]
+    )
+
+    assert "一的进入" not in text
+    assert "更加快速地进入心流状态" in text
+
+
+def test_detailed_record_formatter_covers_long_transcript_segments() -> None:
+    segments = [
+        {
+            "id": index,
+            "start": float(index * 6),
+            "end": float(index * 6 + 5),
+            "text": f"这是第{index}段内容，继续解释同一个主题里的细节和上下文。",
+        }
+        for index in range(1, 81)
+    ]
+
+    record = build_detailed_record_from_segments(
+        title="长视频",
+        summary={"chapters": [{"title": "完整讲解", "start": 0.0, "summary": "概述"}]},
+        segments=segments,
+    )
+    markdown = render_detailed_record_markdown(record)
+    coverage = record["coverage"]
+    micro_segments = [
+        micro
+        for section in record["sections"]
+        for micro in section["microSegments"]
+    ]
+
+    assert coverage["sourceSegmentCount"] == 80
+    assert coverage["coveredSegmentCount"] == 80
+    assert coverage["coverageRatio"] == 1.0
+    assert coverage["missingSegmentIds"] == []
+    assert "第1段内容" in markdown
+    assert "第40段内容" in markdown
+    assert "第80段内容" in markdown
+    assert len(micro_segments) < 80
+    assert "### 时间轴" not in markdown
+
+
+def test_detailed_record_formatter_accepts_micro_segment_config() -> None:
+    segments = [
+        {
+            "id": index,
+            "start": float(index * 4),
+            "end": float(index * 4 + 3),
+            "text": f"这是第{index}段内容，继续解释同一个主题里的细节和上下文。",
+        }
+        for index in range(1, 31)
+    ]
+
+    record = build_detailed_record_from_segments(
+        title="长视频",
+        summary={"chapters": [{"title": "完整讲解", "start": 0.0, "summary": "概述"}]},
+        segments=segments,
+        formatter_config=DetailedRecordFormatterConfig(
+            micro_min_chars=180,
+            micro_target_chars=360,
+            micro_max_chars=700,
+            micro_max_duration_seconds=120,
+        ),
+    )
+    micro_segments = [
+        micro
+        for section in record["sections"]
+        for micro in section["microSegments"]
+    ]
+
+    assert record["coverage"]["coverageRatio"] == 1.0
+    assert record["formatter"]["micro_min_chars"] == 180
+    assert record["formatter"]["micro_target_chars"] == 360
+    assert record["formatter"]["micro_max_chars"] == 700
+    assert all(len(str(micro["text"])) >= 180 for micro in micro_segments[:-1])
+
+
+def test_detailed_record_micro_polish_validation_accepts_faithful_cleanup() -> None:
+    micro = {
+        "text": "这个检索是呃输入关键词之后，去匹配最相关的卡片。",
+        "sourceSegmentIds": [1, 2],
+    }
+
+    accepted, reason, normalized = validate_detailed_record_micro_polish(
+        micro,
+        {
+            "text": "这个检索是输入关键词之后，去匹配最相关的卡片。",
+            "sourceSegmentIds": [1, 2],
+            "edits": ["remove_filler", "punctuation"],
+        },
+    )
+
+    assert accepted is True
+    assert reason == ""
+    assert normalized["text"] == "这个检索是输入关键词之后，去匹配最相关的卡片。"
+    assert normalized["sourceSegmentIds"] == [1, 2]
+    assert normalized["edits"] == ["remove_filler", "punctuation"]
+
+
+def test_detailed_record_micro_polish_validation_rejects_coverage_mismatch() -> None:
+    accepted, reason, normalized = validate_detailed_record_micro_polish(
+        {"text": "完整文本", "sourceSegmentIds": [1, 2]},
+        {"text": "完整文本", "sourceSegmentIds": [1]},
+    )
+
+    assert accepted is False
+    assert reason == "coverage_mismatch"
+    assert normalized == {}
+
+
+def test_detailed_record_micro_polish_validation_rejects_short_summary() -> None:
+    accepted, reason, normalized = validate_detailed_record_micro_polish(
+        {
+            "text": "这个检索是输入关键词之后，关键词会给到AI，AI再去检索每一张卡片的简要摘要，然后匹配最相关的卡片给到结果。",
+            "sourceSegmentIds": [1, 2, 3],
+        },
+        {"text": "介绍检索功能。", "sourceSegmentIds": [1, 2, 3]},
+    )
+
+    assert accepted is False
+    assert reason == "too_short"
+    assert normalized == {}
+
+
+def test_detailed_record_micro_polish_validation_rejects_summary_markers() -> None:
+    accepted, reason, normalized = validate_detailed_record_micro_polish(
+        {"text": "我做了一个检索功能，可以输入关键词匹配卡片。", "sourceSegmentIds": [1]},
+        {"text": "作者认为这个检索功能可以匹配卡片。", "sourceSegmentIds": [1]},
+    )
+
+    assert accepted is False
+    assert reason == "summary_marker"
+    assert normalized == {}
+
+
+def test_detailed_record_llm_polish_is_disabled_by_default(monkeypatch) -> None:
+    runner = RealPipelineRunner(PipelineSettings(tasks_dir=Path("."), llm_enabled=True, llm_api_key="key", llm_base_url="https://llm.example/v1", llm_model="model"))
+    record = build_detailed_record_from_segments(
+        title="测试",
+        summary={"chapters": [{"title": "开场", "start": 0.0, "summary": "概述"}]},
+        segments=[{"id": 1, "start": 0.0, "end": 5.0, "text": "这个检索是呃输入关键词之后去匹配卡片。"}],
+    )
+
+    def fail_request(*args, **kwargs):
+        raise AssertionError("LLM should not be requested when polish is disabled")
+
+    monkeypatch.setattr(runner, "_request_llm_json", fail_request)
+    polished = runner._maybe_polish_detailed_record_with_llm(
+        title="测试",
+        record=record,
+        source_segments=[{"id": 1, "start": 0.0, "end": 5.0, "text": "这个检索是呃输入关键词之后去匹配卡片。"}],
+    )
+    micro = polished["sections"][0]["microSegments"][0]
+
+    assert micro["polish"]["status"] == "not_requested"
+    assert polished["formatter"]["llmPolishEnabled"] is False
+
+
+def test_detailed_record_llm_polish_accepts_valid_micro_result(monkeypatch) -> None:
+    runner = RealPipelineRunner(
+        PipelineSettings(
+            tasks_dir=Path("."),
+            llm_enabled=True,
+            llm_api_key="key",
+            llm_base_url="https://llm.example/v1",
+            llm_model="model",
+            detailed_record_llm_polish_enabled=True,
+        )
+    )
+    source_segments = [
+        {"id": 1, "start": 0.0, "end": 5.0, "text": "这个检索是呃输入关键词之后，"},
+        {"id": 2, "start": 5.0, "end": 9.0, "text": "去匹配最相关的卡片。"},
+    ]
+    record = build_detailed_record_from_segments(
+        title="测试",
+        summary={"chapters": [{"title": "检索", "start": 0.0, "summary": "概述"}]},
+        segments=source_segments,
+    )
+
+    monkeypatch.setattr(
+        runner,
+        "_request_llm_json",
+        lambda **kwargs: {
+            "text": "这个检索是输入关键词之后，去匹配最相关的卡片。",
+            "sourceSegmentIds": [1, 2],
+            "edits": ["remove_filler"],
+        },
+    )
+    polished = runner._maybe_polish_detailed_record_with_llm(title="测试", record=record, source_segments=source_segments)
+    micro = polished["sections"][0]["microSegments"][0]
+
+    assert micro["text"] == "这个检索是输入关键词之后，去匹配最相关的卡片。"
+    assert micro["polish"]["status"] == "accepted"
+    assert polished["coverage"]["coverageRatio"] == 1.0
+    assert polished["formatter"]["llmPolishEnabled"] is True
+
+
+def test_detailed_record_llm_polish_maps_source_segments_without_ids(monkeypatch) -> None:
+    runner = RealPipelineRunner(
+        PipelineSettings(
+            tasks_dir=Path("."),
+            llm_enabled=True,
+            llm_api_key="key",
+            llm_base_url="https://llm.example/v1",
+            llm_model="model",
+            detailed_record_llm_polish_enabled=True,
+            detailed_record_llm_polish_concurrency=1,
+        )
+    )
+    source_segments = [
+        {"start": 0.0, "end": 5.0, "text": "这个检索是呃输入关键词之后，"},
+        {"start": 5.0, "end": 9.0, "text": "去匹配最相关的卡片。"},
+    ]
+    record = build_detailed_record_from_segments(
+        title="测试",
+        summary={"chapters": [{"title": "检索", "start": 0.0, "summary": "概述"}]},
+        segments=source_segments,
+    )
+
+    monkeypatch.setattr(
+        runner,
+        "_request_llm_json",
+        lambda **kwargs: {
+            "text": "这个检索是输入关键词之后，去匹配最相关的卡片。",
+            "sourceSegmentIds": [1, 2],
+            "edits": ["remove_filler"],
+        },
+    )
+    polished = runner._maybe_polish_detailed_record_with_llm(title="测试", record=record, source_segments=source_segments)
+    micro = polished["sections"][0]["microSegments"][0]
+
+    assert micro["polish"]["status"] == "accepted"
+    assert micro["text"] == "这个检索是输入关键词之后，去匹配最相关的卡片。"
+
+
+def test_detailed_record_llm_polish_rejects_invalid_micro_result(monkeypatch) -> None:
+    runner = RealPipelineRunner(
+        PipelineSettings(
+            tasks_dir=Path("."),
+            llm_enabled=True,
+            llm_api_key="key",
+            llm_base_url="https://llm.example/v1",
+            llm_model="model",
+            detailed_record_llm_polish_enabled=True,
+        )
+    )
+    source_segments = [
+        {"id": 1, "start": 0.0, "end": 5.0, "text": "我做了一个检索功能，可以输入关键词匹配卡片。"},
+    ]
+    record = build_detailed_record_from_segments(
+        title="测试",
+        summary={"chapters": [{"title": "检索", "start": 0.0, "summary": "概述"}]},
+        segments=source_segments,
+    )
+    original_text = record["sections"][0]["microSegments"][0]["text"]
+
+    monkeypatch.setattr(
+        runner,
+        "_request_llm_json",
+        lambda **kwargs: {"text": "作者认为检索功能可以匹配卡片。", "sourceSegmentIds": [1], "edits": ["summary"]},
+    )
+    polished = runner._maybe_polish_detailed_record_with_llm(title="测试", record=record, source_segments=source_segments)
+    micro = polished["sections"][0]["microSegments"][0]
+
+    assert micro["text"] == original_text
+    assert micro["polish"]["status"] == "rejected"
+    assert micro["polish"]["reason"] == "summary_marker"
+    assert polished["coverage"]["coverageRatio"] == 1.0
 
 
 def test_aggregate_series_note_prompt_uses_page_positioning() -> None:
@@ -511,7 +893,16 @@ def test_export_result_preserves_llm_usage(tmp_path: Path) -> None:
 
 
 def test_export_result_writes_detailed_record_variant(tmp_path: Path) -> None:
-    runner = RealPipelineRunner(PipelineSettings(tasks_dir=Path("."), llm_enabled=False))
+    runner = RealPipelineRunner(
+        PipelineSettings(
+            tasks_dir=Path("."),
+            llm_enabled=False,
+            detailed_record_micro_min_chars=180,
+            detailed_record_micro_target_chars=360,
+            detailed_record_micro_max_chars=700,
+            detailed_record_micro_max_duration_seconds=120,
+        )
+    )
     task_dir = tmp_path / "tmp_export_detailed_record"
     task_dir.mkdir(parents=True, exist_ok=True)
 
@@ -541,6 +932,10 @@ def test_export_result_writes_detailed_record_variant(tmp_path: Path) -> None:
     assert Path(detailed.structured_artifact_path).exists()
     assert Path(detailed.artifact_path).exists()
     assert result.artifacts["note_variant_detailed_record_json_path"].endswith("detailed_record.json")
+    assert detailed.structured is not None
+    assert detailed.structured["formatter"]["micro_min_chars"] == 180
+    assert detailed.structured["formatter"]["micro_target_chars"] == 360
+    assert detailed.structured["formatter"]["micro_max_chars"] == 700
 
 
 def test_visual_base_note_uses_primary_detailed_record_variant() -> None:

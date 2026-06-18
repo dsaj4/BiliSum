@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,6 +10,80 @@ KNOWLEDGE_NOTE_MODE = "knowledge_note"
 DETAILED_RECORD_MODE = "detailed_record"
 DETAILED_RECORD_STYLE = "discourse_aligned_transcript"
 DEFAULT_NOTE_MODES = [KNOWLEDGE_NOTE_MODE]
+MICRO_MIN_CHARS = 100
+MICRO_TARGET_CHARS = 220
+MICRO_MAX_CHARS = 420
+MICRO_SOFT_GAP_SECONDS = 1.2
+MICRO_HARD_GAP_SECONDS = 2.5
+MICRO_MAX_DURATION_SECONDS = 90
+SECTION_TARGET_MICROS = 8
+SECTION_MAX_DURATION_SECONDS = 420
+
+FILLER_PATTERNS = (
+    r"(?<![\w\u4e00-\u9fff])[呃嗯啊额](?![\w\u4e00-\u9fff])",
+    r"^(呃|嗯|啊|额)[，,\s]+",
+)
+MID_SENTENCE_FILLER_PREFIXES = (
+    "这里",
+    "那里",
+    "这边",
+    "那边",
+    "现在",
+    "然后",
+    "所以",
+    "就是",
+    "这个",
+    "那个",
+    "其实",
+    "可能",
+    "比如说",
+    "假如",
+    "那么",
+    "那",
+    "是",
+    "在",
+    "把",
+    "给",
+    "让",
+    "会",
+    "要",
+    "就",
+    "都",
+    "还",
+    "再",
+    "并",
+    "和",
+    "跟",
+    "对",
+    "用",
+    "按",
+)
+DETAILED_RECORD_SUMMARY_MARKERS = (
+    "作者认为",
+    "作者介绍",
+    "本段介绍",
+    "本段说明",
+    "这一部分",
+    "视频中提到",
+    "UP主认为",
+    "UP 主认为",
+)
+
+DISCOURSE_BOUNDARY_PREFIXES = (
+    "首先",
+    "然后",
+    "接下来",
+    "另外",
+    "但是",
+    "不过",
+    "所以",
+    "那么",
+    "回到",
+    "总结一下",
+    "最后",
+    "举个例子",
+    "换句话说",
+)
 
 
 @dataclass(frozen=True)
@@ -16,6 +91,29 @@ class NoteModeDefinition:
     id: str
     label: str
     description: str
+
+
+@dataclass(frozen=True)
+class DetailedRecordFormatterConfig:
+    micro_min_chars: int = MICRO_MIN_CHARS
+    micro_target_chars: int = MICRO_TARGET_CHARS
+    micro_max_chars: int = MICRO_MAX_CHARS
+    micro_soft_gap_seconds: float = MICRO_SOFT_GAP_SECONDS
+    micro_hard_gap_seconds: float = MICRO_HARD_GAP_SECONDS
+    micro_max_duration_seconds: float = MICRO_MAX_DURATION_SECONDS
+
+    def normalized(self) -> "DetailedRecordFormatterConfig":
+        micro_min_chars = max(40, int(self.micro_min_chars or MICRO_MIN_CHARS))
+        micro_target_chars = max(micro_min_chars, int(self.micro_target_chars or MICRO_TARGET_CHARS))
+        micro_max_chars = max(micro_target_chars, int(self.micro_max_chars or MICRO_MAX_CHARS))
+        return DetailedRecordFormatterConfig(
+            micro_min_chars=micro_min_chars,
+            micro_target_chars=micro_target_chars,
+            micro_max_chars=micro_max_chars,
+            micro_soft_gap_seconds=max(0.0, float(self.micro_soft_gap_seconds)),
+            micro_hard_gap_seconds=max(0.0, float(self.micro_hard_gap_seconds)),
+            micro_max_duration_seconds=max(10.0, float(self.micro_max_duration_seconds)),
+        )
 
 
 NOTE_MODE_REGISTRY: dict[str, NoteModeDefinition] = {
@@ -153,20 +251,55 @@ def build_detailed_record_fallback(
     title: str,
     summary: dict[str, object],
     segments: list[dict[str, object]],
+    formatter_config: DetailedRecordFormatterConfig | None = None,
 ) -> dict[str, object]:
-    chapters = [item for item in summary.get("chapters") or [] if isinstance(item, dict)]
-    source_segments = [item for item in segments if isinstance(item, dict)]
-    if not source_segments and chapters:
-        source_segments = [
-            {
-                "start": _safe_float(item.get("start")),
-                "end": _safe_float(item.get("end")),
-                "text": str(item.get("text") or item.get("summary") or item.get("title") or "").strip(),
-            }
-            for item in chapters
-        ]
-    sections = _build_fallback_sections(chapters, source_segments)
-    return _build_detailed_record_v2(title, sections, {})
+    return build_detailed_record_from_segments(
+        title=title,
+        summary=summary,
+        segments=segments,
+        formatter_config=formatter_config,
+    )
+
+
+def build_detailed_record_from_segments(
+    *,
+    title: str,
+    summary: dict[str, object],
+    segments: list[dict[str, object]],
+    formatter_config: DetailedRecordFormatterConfig | None = None,
+) -> dict[str, object]:
+    config = (formatter_config or DetailedRecordFormatterConfig()).normalized()
+    source_segments = _normalize_source_segments(segments)
+    if not source_segments:
+        chapters = [item for item in summary.get("chapters") or [] if isinstance(item, dict)]
+        source_segments = _normalize_source_segments(
+            [
+                {
+                    "id": index,
+                    "start": _safe_float(item.get("start")),
+                    "end": _safe_float(item.get("end")),
+                    "text": str(item.get("text") or item.get("summary") or item.get("title") or "").strip(),
+                }
+                for index, item in enumerate(chapters, start=1)
+            ]
+        )
+    sentence_units = _build_sentence_units(source_segments)
+    micro_segments = _build_micro_segments_from_sentence_units(sentence_units, config)
+    sections = _build_sections_from_micro_segments(micro_segments, summary)
+    record = _build_detailed_record_v2(title, sections, {})
+    record["rawSegmentCount"] = len(source_segments)
+    record["sentenceUnitCount"] = len(sentence_units)
+    record["coverage"] = _build_coverage(source_segments, sections)
+    record["formatter"] = {
+        "name": "formatted_transcript_pipeline",
+        "micro_min_chars": config.micro_min_chars,
+        "micro_target_chars": config.micro_target_chars,
+        "micro_max_chars": config.micro_max_chars,
+        "soft_gap_seconds": config.micro_soft_gap_seconds,
+        "hard_gap_seconds": config.micro_hard_gap_seconds,
+        "max_duration_seconds": config.micro_max_duration_seconds,
+    }
+    return record
 
 
 def render_detailed_record_markdown(record: dict[str, object]) -> str:
@@ -231,6 +364,7 @@ def detailed_record_quality(record: dict[str, object]) -> dict[str, object]:
             "has_timeline": bool(record.get("timeline")),
             "has_visual_refs": any(item.get("visualRefs") for item in micro_segments),
             "faithfulness_mode": "transcript",
+            "coverage": record.get("coverage") if isinstance(record.get("coverage"), dict) else {},
         }
 
     segments = [item for item in record.get("segments") or [] if isinstance(item, dict)]
@@ -239,6 +373,35 @@ def detailed_record_quality(record: dict[str, object]) -> dict[str, object]:
         "has_compact_summary": bool(str(record.get("compactSummary") or "").strip()),
         "json_chars": len(json.dumps(record, ensure_ascii=False)),
     }
+
+
+def validate_detailed_record_micro_polish(
+    micro_segment: dict[str, object],
+    payload: dict[str, object],
+    *,
+    min_length_ratio: float = 0.65,
+) -> tuple[bool, str, dict[str, object]]:
+    source_ids = [item for item in micro_segment.get("sourceSegmentIds") or [] if item is not None]
+    returned_ids = [item for item in payload.get("sourceSegmentIds") or [] if item is not None]
+    if returned_ids != source_ids:
+        return False, "coverage_mismatch", {}
+
+    text = _normalize_transcript_text(str(payload.get("text") or ""))
+    if not text:
+        return False, "empty_text", {}
+
+    local_text = _normalize_transcript_text(str(micro_segment.get("text") or ""))
+    if len(local_text) >= 40 and len(text) < int(len(local_text) * min_length_ratio):
+        return False, "too_short", {}
+
+    if any(marker in text for marker in DETAILED_RECORD_SUMMARY_MARKERS):
+        return False, "summary_marker", {}
+
+    if re.search(r"(^|\n)\s{0,3}#{1,6}\s+", text) or re.search(r"(^|\n)\s*[-*]\s+", text):
+        return False, "markdown_structure", {}
+
+    edits = [str(item).strip() for item in payload.get("edits") or [] if str(item).strip()]
+    return True, "", {"text": text, "sourceSegmentIds": returned_ids, "edits": edits}
 
 
 def _normalize_detailed_segment(item: dict[str, Any], index: int) -> dict[str, object] | None:
@@ -373,6 +536,236 @@ def _build_section_from_micro_segments(
     }
 
 
+def _normalize_source_segments(segments: list[dict[str, object]]) -> list[dict[str, object]]:
+    normalized: list[dict[str, object]] = []
+    for index, item in enumerate(segments, start=1):
+        if not isinstance(item, dict):
+            continue
+        text = _normalize_transcript_text(str(item.get("text") or "").strip())
+        if not text:
+            continue
+        start = _safe_float(item.get("start"))
+        end = _safe_float(item.get("end"))
+        if end is None:
+            end = start
+        normalized.append(
+            {
+                "id": item.get("id") or index,
+                "index": index,
+                "start": start,
+                "end": end,
+                "text": _clean_transcript_text(text),
+            }
+        )
+    return normalized
+
+
+def _build_sentence_units(segments: list[dict[str, object]]) -> list[dict[str, object]]:
+    units: list[dict[str, object]] = []
+    buffer: list[dict[str, object]] = []
+    buffer_chars = 0
+    previous_end: float | None = None
+
+    for item in segments:
+        text = str(item.get("text") or "").strip()
+        if not text:
+            continue
+        start = _safe_float(item.get("start"))
+        gap = _gap_seconds(previous_end, start)
+        if buffer and gap is not None and gap >= MICRO_HARD_GAP_SECONDS:
+            units.append(_flush_sentence_unit(buffer, len(units) + 1))
+            buffer = []
+            buffer_chars = 0
+        buffer.append(item)
+        buffer_chars += len(text)
+        previous_end = _safe_float(item.get("end")) or start or previous_end
+        if buffer_chars >= 160 or _has_sentence_terminal(text):
+            units.append(_flush_sentence_unit(buffer, len(units) + 1))
+            buffer = []
+            buffer_chars = 0
+
+    if buffer:
+        units.append(_flush_sentence_unit(buffer, len(units) + 1))
+    return units
+
+
+def _flush_sentence_unit(buffer: list[dict[str, object]], index: int) -> dict[str, object]:
+    text = _join_transcript_parts(str(item.get("text") or "") for item in buffer)
+    return {
+        "id": f"u{index}",
+        "index": index,
+        "start": _safe_float(buffer[0].get("start")),
+        "end": _safe_float(buffer[-1].get("end")) or _safe_float(buffer[-1].get("start")),
+        "text": text,
+        "sourceSegmentIds": [item.get("id") for item in buffer if item.get("id") is not None],
+    }
+
+
+def _build_micro_segments_from_sentence_units(
+    units: list[dict[str, object]],
+    config: DetailedRecordFormatterConfig,
+) -> list[dict[str, object]]:
+    micro_segments: list[dict[str, object]] = []
+    buffer: list[dict[str, object]] = []
+    last_boundary_index: int | None = None
+
+    for unit in units:
+        if buffer and _should_flush_micro_segment(buffer, unit, config):
+            flushed_buffer = buffer
+            if _buffer_chars(buffer) > config.micro_max_chars and last_boundary_index is not None and last_boundary_index > 0:
+                flushed_buffer = buffer[:last_boundary_index]
+                buffer = buffer[last_boundary_index:]
+            else:
+                buffer = []
+            micro_segments.append(_flush_micro_unit_buffer(flushed_buffer, len(micro_segments) + 1))
+            last_boundary_index = None
+        buffer.append(unit)
+        if _is_natural_micro_boundary(unit):
+            last_boundary_index = len(buffer)
+
+    if buffer:
+        micro_segments.append(_flush_micro_unit_buffer(buffer, len(micro_segments) + 1))
+    return _merge_short_micro_segments(micro_segments, config)
+
+
+def _should_flush_micro_segment(
+    buffer: list[dict[str, object]],
+    next_unit: dict[str, object],
+    config: DetailedRecordFormatterConfig,
+) -> bool:
+    chars = _buffer_chars(buffer)
+    next_chars = len(str(next_unit.get("text") or ""))
+    duration = _buffer_duration(buffer)
+    gap = _gap_seconds(_safe_float(buffer[-1].get("end")), _safe_float(next_unit.get("start")))
+    if chars < config.micro_min_chars:
+        return False
+    if gap is not None and gap >= config.micro_hard_gap_seconds:
+        return True
+    if duration >= config.micro_max_duration_seconds:
+        return True
+    if chars + next_chars > config.micro_max_chars:
+        return True
+    if chars >= config.micro_target_chars and _is_natural_micro_boundary(buffer[-1]):
+        return True
+    if chars >= config.micro_target_chars and gap is not None and gap >= config.micro_soft_gap_seconds:
+        return True
+    return False
+
+
+def _flush_micro_unit_buffer(buffer: list[dict[str, object]], index: int) -> dict[str, object]:
+    text = _join_transcript_parts(str(item.get("text") or "") for item in buffer)
+    return {
+        "id": f"m{index}",
+        "index": index,
+        "start": _safe_float(buffer[0].get("start")),
+        "end": _safe_float(buffer[-1].get("end")) or _safe_float(buffer[-1].get("start")),
+        "text": text,
+        "sourceSegmentIds": _collect_ids_from_units(buffer),
+        "visualRefs": [],
+    }
+
+
+def _merge_short_micro_segments(
+    micro_segments: list[dict[str, object]],
+    config: DetailedRecordFormatterConfig,
+) -> list[dict[str, object]]:
+    merged: list[dict[str, object]] = []
+    for item in micro_segments:
+        text = str(item.get("text") or "")
+        if merged and len(text) < config.micro_min_chars:
+            previous = merged[-1]
+            previous["text"] = _join_transcript_parts([str(previous.get("text") or ""), text])
+            previous["end"] = item.get("end")
+            previous["sourceSegmentIds"] = _merge_ids(previous.get("sourceSegmentIds"), item.get("sourceSegmentIds"))
+            continue
+        merged.append(dict(item))
+    for index, item in enumerate(merged, start=1):
+        item["id"] = f"m{index}"
+        item["index"] = index
+    return merged
+
+
+def _build_sections_from_micro_segments(
+    micro_segments: list[dict[str, object]],
+    summary: dict[str, object],
+) -> list[dict[str, object]]:
+    if not micro_segments:
+        return []
+    chapter_titles = [
+        str(item.get("title") or "").strip()
+        for item in summary.get("chapters") or []
+        if isinstance(item, dict) and str(item.get("title") or "").strip()
+    ]
+    sections: list[dict[str, object]] = []
+    buffer: list[dict[str, object]] = []
+    for micro in micro_segments:
+        if buffer and _should_flush_section(buffer, micro):
+            sections.append(
+                _build_section_from_micro_segments(
+                    index=len(sections) + 1,
+                    title=_section_title(buffer, chapter_titles, len(sections) + 1),
+                    micro_segments=buffer,
+                )
+            )
+            buffer = []
+        buffer.append(micro)
+    if buffer:
+        sections.append(
+            _build_section_from_micro_segments(
+                index=len(sections) + 1,
+                title=_section_title(buffer, chapter_titles, len(sections) + 1),
+                micro_segments=buffer,
+            )
+        )
+    return sections
+
+
+def _should_flush_section(buffer: list[dict[str, object]], next_micro: dict[str, object]) -> bool:
+    duration = _safe_float(buffer[-1].get("end") or 0) - (_safe_float(buffer[0].get("start")) or 0)
+    gap = _gap_seconds(_safe_float(buffer[-1].get("end")), _safe_float(next_micro.get("start")))
+    if gap is not None and gap >= 8 and len(buffer) >= 2:
+        return True
+    if duration >= SECTION_MAX_DURATION_SECONDS and len(buffer) >= 2:
+        return True
+    if len(buffer) >= SECTION_TARGET_MICROS:
+        return True
+    return False
+
+
+def _section_title(buffer: list[dict[str, object]], chapter_titles: list[str], index: int) -> str:
+    if index <= len(chapter_titles):
+        return chapter_titles[index - 1]
+    return _derive_title(str(buffer[0].get("text") or ""), f"章节 {index}")
+
+
+def _build_coverage(source_segments: list[dict[str, object]], sections: list[dict[str, object]]) -> dict[str, object]:
+    source_ids = [item.get("id") for item in source_segments if item.get("id") is not None]
+    covered: list[object] = []
+    for section in sections:
+        for micro in section.get("microSegments") or []:
+            if not isinstance(micro, dict):
+                continue
+            for source_id in micro.get("sourceSegmentIds") or []:
+                if source_id not in covered:
+                    covered.append(source_id)
+    missing = [source_id for source_id in source_ids if source_id not in covered]
+    duplicates = _duplicate_ids(
+        source_id
+        for section in sections
+        for micro in section.get("microSegments", [])
+        if isinstance(micro, dict)
+        for source_id in micro.get("sourceSegmentIds", [])
+    )
+    return {
+        "sourceSegmentCount": len(source_ids),
+        "coveredSegmentCount": len(covered),
+        "coverageRatio": round(len(covered) / len(source_ids), 4) if source_ids else 1.0,
+        "missingSegmentIds": missing[:50],
+        "duplicateSegmentIds": duplicates[:50],
+        "maxGapSeconds": _max_covered_gap_seconds(sections),
+    }
+
+
 def _build_fallback_sections(
     chapters: list[dict[str, object]],
     segments: list[dict[str, object]],
@@ -472,20 +865,6 @@ def _render_detailed_record_markdown_v2(record: dict[str, object]) -> str:
     title = str(record.get("title") or "逐句实录").strip()
     lines = [f"# {title}", "", "## 逐句实录", ""]
     sections = [item for item in record.get("sections") or [] if isinstance(item, dict)]
-    timeline = [item for item in record.get("timeline") or [] if isinstance(item, dict)]
-    if timeline:
-        lines.extend(["### 时间轴", ""])
-        for item in timeline:
-            anchor = _format_anchor(_safe_float(item.get("start")), _safe_float(item.get("end")))
-            label = str(item.get("title") or "").strip()
-            if anchor and label:
-                lines.append(f"- {anchor} {label}")
-            elif label:
-                lines.append(f"- {label}")
-            elif anchor:
-                lines.append(f"- {anchor}")
-        lines.append("")
-
     for section_index, section in enumerate(sections, start=1):
         heading = str(section.get("title") or f"章节 {section_index}").strip()
         anchor = _format_anchor(_safe_float(section.get("start")), _safe_float(section.get("end")))
@@ -512,6 +891,116 @@ def _render_detailed_record_markdown_v2(record: dict[str, object]) -> str:
 
 def _normalize_transcript_text(text: str) -> str:
     return " ".join(str(text or "").replace("\n", " ").split()).strip()
+
+
+def _clean_transcript_text(text: str) -> str:
+    cleaned = _normalize_transcript_text(text)
+    cleaned = cleaned.replace(" ,", "，").replace(" .", "。").replace(" ?", "？").replace(" !", "！")
+    cleaned = cleaned.replace(",", "，").replace("?", "？").replace("!", "！")
+    cleaned = re.sub(r"\s+([，。！？；：])", r"\1", cleaned)
+    cleaned = re.sub(r"([，。！？；：])\s+", r"\1", cleaned)
+    for pattern in FILLER_PATTERNS:
+        cleaned = re.sub(pattern, "", cleaned)
+    cleaned = _remove_mid_sentence_fillers(cleaned)
+    cleaned = re.sub(r"(然后)[，\s]*(然后)", r"\1", cleaned)
+    cleaned = re.sub(r"(就是)[，\s]*(就是)", r"\1", cleaned)
+    cleaned = re.sub(r"(这个)[，\s]*(这个)", r"\1", cleaned)
+    cleaned = re.sub(r"快速一的进入", "快速地进入", cleaned)
+    return _normalize_transcript_text(cleaned)
+
+
+def _remove_mid_sentence_fillers(text: str) -> str:
+    prefixes = "|".join(re.escape(prefix) for prefix in sorted(MID_SENTENCE_FILLER_PREFIXES, key=len, reverse=True))
+    cleaned = re.sub(
+        rf"({prefixes})[呃嗯啊额](?=[\u4e00-\u9fffA-Za-z0-9])",
+        r"\1",
+        text,
+    )
+    return re.sub(r"(?<=[\u4e00-\u9fffA-Za-z0-9])[呃嗯啊额](?=[\u4e00-\u9fffA-Za-z0-9])", "", cleaned)
+
+
+def _join_transcript_parts(parts: Any) -> str:
+    text = "".join(str(part or "").strip() for part in parts if str(part or "").strip())
+    text = re.sub(r"([。！？])(?=[\u4e00-\u9fffA-Za-z0-9])", r"\1", text)
+    return _clean_transcript_text(text)
+
+
+def _has_sentence_terminal(text: str) -> bool:
+    return str(text or "").rstrip().endswith(("。", "！", "？", ".", "!", "?"))
+
+
+def _is_natural_micro_boundary(unit: dict[str, object]) -> bool:
+    text = str(unit.get("text") or "").strip()
+    if _has_sentence_terminal(text):
+        return True
+    return any(text.startswith(prefix) for prefix in DISCOURSE_BOUNDARY_PREFIXES)
+
+
+def _buffer_chars(buffer: list[dict[str, object]]) -> int:
+    return sum(len(str(item.get("text") or "")) for item in buffer)
+
+
+def _buffer_duration(buffer: list[dict[str, object]]) -> float:
+    if not buffer:
+        return 0.0
+    start = _safe_float(buffer[0].get("start")) or 0.0
+    end = _safe_float(buffer[-1].get("end")) or _safe_float(buffer[-1].get("start")) or start
+    return max(0.0, end - start)
+
+
+def _gap_seconds(previous_end: float | None, next_start: float | None) -> float | None:
+    if previous_end is None or next_start is None:
+        return None
+    return max(0.0, next_start - previous_end)
+
+
+def _collect_ids_from_units(units: list[dict[str, object]]) -> list[object]:
+    ids: list[object] = []
+    for unit in units:
+        for source_id in unit.get("sourceSegmentIds") or []:
+            if source_id not in ids:
+                ids.append(source_id)
+    return ids
+
+
+def _merge_ids(left: object, right: object) -> list[object]:
+    ids: list[object] = []
+    for value in (left, right):
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if item is not None and item not in ids:
+                ids.append(item)
+    return ids
+
+
+def _duplicate_ids(values: Any) -> list[object]:
+    seen: list[object] = []
+    duplicates: list[object] = []
+    for value in values:
+        if value in seen and value not in duplicates:
+            duplicates.append(value)
+        seen.append(value)
+    return duplicates
+
+
+def _max_covered_gap_seconds(sections: list[dict[str, object]]) -> float:
+    micros = [
+        micro
+        for section in sections
+        for micro in section.get("microSegments", [])
+        if isinstance(micro, dict)
+    ]
+    micros.sort(key=lambda item: _safe_float(item.get("start")) or 0.0)
+    max_gap = 0.0
+    previous_end: float | None = None
+    for micro in micros:
+        start = _safe_float(micro.get("start"))
+        gap = _gap_seconds(previous_end, start)
+        if gap is not None:
+            max_gap = max(max_gap, gap)
+        previous_end = _safe_float(micro.get("end")) or start or previous_end
+    return round(max_gap, 3)
 
 
 def _normalize_source_ids(value: object) -> list[object]:

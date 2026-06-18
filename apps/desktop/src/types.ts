@@ -4,6 +4,7 @@ export type PageAggregateStatus = "not_started" | "in_progress" | "completed" | 
 export type TimelineItem = {
   title?: string;
   start?: number;
+  end?: number;
   summary?: string;
 };
 
@@ -485,6 +486,14 @@ export type ServiceSettings = {
   mindmap_concurrency: number;
   summary_chunk_concurrency: number;
   summary_chunk_retry_count: number;
+  detailed_record_micro_min_chars: number;
+  detailed_record_micro_target_chars: number;
+  detailed_record_micro_max_chars: number;
+  detailed_record_micro_max_duration_seconds: number;
+  detailed_record_llm_polish_enabled: boolean;
+  detailed_record_llm_polish_max_chars: number;
+  detailed_record_llm_polish_concurrency: number;
+  detailed_record_llm_polish_retry_count: number;
   ytdlp_cookies_file: string;
   ytdlp_cookies_browser: string;
   settings_file_exists?: boolean;

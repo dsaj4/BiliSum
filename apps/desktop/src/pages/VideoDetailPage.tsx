@@ -59,6 +59,12 @@ type SnapshotMetric = {
   value: string;
 };
 
+type DetailedRecordTimelineItem = {
+  title: string;
+  start: number | null;
+  end: number | null;
+};
+
 type ProgressPhase = {
   id: "prepare" | "media" | "summary" | "export" | "mindmap" | "knowledge" | "other";
   label: string;
@@ -198,6 +204,38 @@ function noteVariantDescription(variant: NoteVariant): string {
     return "结构化 JSON + Markdown 笔记产物。";
   }
   return "Markdown 笔记产物。";
+}
+
+function resolveDetailedRecordTimeline(variant: NoteVariant | null): DetailedRecordTimelineItem[] {
+  if (!variant || variant.id !== "detailed_record" || !variant.structured) {
+    return [];
+  }
+  const structured = variant.structured;
+  const rawTimeline = Array.isArray(structured.timeline) ? structured.timeline : [];
+  const timeline = rawTimeline
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+    .map((item, index) => ({
+      title: String(item.title || item.label || `片段 ${index + 1}`),
+      start: coerceNumber(item.start),
+      end: coerceNumber(item.end),
+    }))
+    .filter((item) => item.title.trim() || item.start !== null || item.end !== null);
+  if (timeline.length) {
+    return timeline;
+  }
+  const rawSections = Array.isArray(structured.sections) ? structured.sections : [];
+  return rawSections
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+    .map((item, index) => ({
+      title: String(item.title || `章节 ${index + 1}`),
+      start: coerceNumber(item.start),
+      end: coerceNumber(item.end),
+    }));
+}
+
+function coerceNumber(value: unknown): number | null {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function compareTasksByRecent(left: TaskSummary, right: TaskSummary) {
@@ -404,6 +442,7 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
   const [knowledgeNoteViewMode, setKnowledgeNoteViewMode] = useState<KnowledgeNoteViewMode>(() => loadKnowledgeNoteViewMode());
   const [selectedNoteVariantId, setSelectedNoteVariantId] = useState<string | null>(null);
   const [knowledgeNoteModeMenuOpen, setKnowledgeNoteModeMenuOpen] = useState(false);
+  const [detailedRecordTimelineOpen, setDetailedRecordTimelineOpen] = useState(false);
   const [isExportingKnowledgeCard, setIsExportingKnowledgeCard] = useState(false);
   const [isExportingKnowledgeNote, setIsExportingKnowledgeNote] = useState(false);
   const [isExportingTranscript, setIsExportingTranscript] = useState(false);
@@ -1234,6 +1273,8 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
   const displayedKnowledgeNoteMarkdown = effectiveKnowledgeNoteViewMode === "visual"
     ? selectedEnhancedNoteMarkdown
     : selectedNoteVariant?.markdown || selectedKnowledgeNoteMarkdown;
+  const detailedRecordTimeline = useMemo(() => resolveDetailedRecordTimeline(selectedNoteVariant), [selectedNoteVariant]);
+  const showDetailedRecordTimeline = selectedNoteVariant?.id === "detailed_record" && detailedRecordTimeline.length > 0;
   const knowledgeNoteModeLabel = selectedNoteVariant
     ? `${selectedNoteVariant.label} / ${effectiveKnowledgeNoteViewMode === "visual" ? "图文" : "纯文本"}`
     : (effectiveKnowledgeNoteViewMode === "visual" ? "图文" : "纯文本");
@@ -2824,15 +2865,27 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
                     {!knowledgeOutputDir && !window.desktop?.dialog ? (
                       <p className="detail-section-body">导出前请先在设置中填写输出目录，Markdown / Obsidian 笔记会写入该目录。</p>
                     ) : null}
-                    {displayedKnowledgeNoteMarkdown ? (
-                      <MarkdownContent
-                        className="detail-note-markdown"
-                        content={displayedKnowledgeNoteMarkdown}
-                        imageResolver={(src) => resolveVisualNoteImageSrc(selectedTaskId, src)}
-                      />
-                    ) : (
-                      <p className="detail-section-body">当前任务还没有生成知识笔记。</p>
-                    )}
+                    <div className={showDetailedRecordTimeline ? "detail-note-with-timeline" : ""}>
+                      <div className="detail-note-main">
+                        {displayedKnowledgeNoteMarkdown ? (
+                          <MarkdownContent
+                            className="detail-note-markdown"
+                            content={displayedKnowledgeNoteMarkdown}
+                            imageResolver={(src) => resolveVisualNoteImageSrc(selectedTaskId, src)}
+                          />
+                        ) : (
+                          <p className="detail-section-body">当前任务还没有生成知识笔记。</p>
+                        )}
+                      </div>
+                      {showDetailedRecordTimeline ? (
+                        <DetailedRecordTimelinePanel
+                          items={detailedRecordTimeline}
+                          open={detailedRecordTimelineOpen}
+                          onToggle={() => setDetailedRecordTimelineOpen((current) => !current)}
+                          onSeekToTimestamp={!isAggregateSummaryView && hasSeekablePlayer ? handleSeekToChapter : undefined}
+                        />
+                      ) : null}
+                    </div>
                     {visualEvidenceMatchesSelectedNote ? (
                     <details className="detail-visual-assets-details detail-note-assets-details">
                       <summary>
@@ -3174,6 +3227,73 @@ function KnowledgeCardBlock({
       </div>
     </article>
   );
+}
+
+function DetailedRecordTimelinePanel({
+  items,
+  open,
+  onToggle,
+  onSeekToTimestamp,
+}: {
+  items: DetailedRecordTimelineItem[];
+  open: boolean;
+  onToggle: () => void;
+  onSeekToTimestamp?: (seconds: number | null) => void;
+}) {
+  return (
+    <aside className={`detail-record-timeline-panel ${open ? "is-open" : ""}`} aria-label="逐句实录时间轴">
+      <button
+        className="detail-record-timeline-toggle"
+        type="button"
+        onClick={onToggle}
+        aria-expanded={open}
+      >
+        <IconClock />
+        <span>时间轴</span>
+        <IconChevronDown className="detail-record-timeline-caret" />
+      </button>
+      {open ? (
+        <div className="detail-record-timeline-list">
+          {items.map((item, index) => {
+            const canSeek = typeof item.start === "number" && Boolean(onSeekToTimestamp);
+            const body = (
+              <>
+                <span className="detail-record-timeline-index">{index + 1}</span>
+                <span className="detail-record-timeline-copy">
+                  <strong>{item.title || `片段 ${index + 1}`}</strong>
+                  <small>{formatTimelineRange(item.start, item.end)}</small>
+                </span>
+              </>
+            );
+            return canSeek ? (
+              <button
+                className="detail-record-timeline-item is-actionable"
+                key={`${item.title}-${index}`}
+                type="button"
+                onClick={() => onSeekToTimestamp?.(item.start)}
+              >
+                {body}
+              </button>
+            ) : (
+              <div className="detail-record-timeline-item" key={`${item.title}-${index}`}>
+                {body}
+              </div>
+            );
+          })}
+        </div>
+      ) : null}
+    </aside>
+  );
+}
+
+function formatTimelineRange(start: number | null, end: number | null) {
+  if (start === null && end === null) {
+    return "--";
+  }
+  if (end === null || end === start) {
+    return formatDuration(start ?? 0);
+  }
+  return `${formatDuration(start ?? 0)} - ${formatDuration(end)}`;
 }
 
 function findMindMapNodeById(root: MindMapNode, nodeId: string): MindMapNode | null {

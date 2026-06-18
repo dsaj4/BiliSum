@@ -55,15 +55,17 @@ from video_sum_core.errors import (
 from video_sum_core.models.tasks import InputType, MindMapNode, NoteVariant, TaskInput, TaskMindMap, TaskResult
 from video_sum_core.note_modes import (
     DETAILED_RECORD_MODE,
+    DetailedRecordFormatterConfig,
     KNOWLEDGE_NOTE_MODE,
     NOTE_MODE_REGISTRY,
+    build_detailed_record_from_segments,
     build_detailed_record_fallback,
     detailed_record_quality,
-    normalize_detailed_record_payload,
     normalize_note_modes,
     normalize_primary_note_mode,
     note_mode_definition,
     render_detailed_record_markdown,
+    validate_detailed_record_micro_polish,
 )
 from video_sum_core.pipeline.base import (
     PipelineContext,
@@ -259,6 +261,14 @@ class PipelineSettings:
     summary_chunk_overlap_segments: int = 2
     summary_chunk_concurrency: int = 2
     summary_chunk_retry_count: int = 2
+    detailed_record_micro_min_chars: int = 180
+    detailed_record_micro_target_chars: int = 360
+    detailed_record_micro_max_chars: int = 700
+    detailed_record_micro_max_duration_seconds: int = 120
+    detailed_record_llm_polish_enabled: bool = False
+    detailed_record_llm_polish_max_chars: int = 900
+    detailed_record_llm_polish_concurrency: int = 2
+    detailed_record_llm_polish_retry_count: int = 1
     ytdlp_cookies_file: str = ""
     ytdlp_cookies_browser: str = ""
 
@@ -3221,6 +3231,64 @@ P 数索引：
         )
         return self._request_llm_json(base_url=base_url, payload=payload)
 
+    def _build_llm_detailed_record_micro_polish_payload(
+        self,
+        *,
+        title: str,
+        section_title: str,
+        micro_segment: dict[str, object],
+        source_segments: list[dict[str, object]],
+    ) -> dict[str, object]:
+        source_payload = [
+            {
+                "id": item.get("id"),
+                "start": item.get("start"),
+                "end": item.get("end"),
+                "text": str(item.get("text") or "").strip(),
+            }
+            for item in source_segments
+            if str(item.get("text") or "").strip()
+        ]
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "你是一名严谨的中文转写稿编辑。你的任务是对一个已经切好的逐句实录微段做忠实润色，"
+                    "不是总结、不是提炼知识点、不是改写成第三人称。必须保留原始顺序、人称、事实和细节，"
+                    "只允许补标点、去明显语气词/口误、合并碎片短句、修正明显 ASR 错字。"
+                    "不要输出 Markdown、标题、项目符号、时间轴或解释说明。You must return valid json only."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"""请返回一个 JSON 对象，顶层只包含 text、sourceSegmentIds、edits。
+
+硬性约束：
+1. text 必须忠实保留原始材料的表达、人称、顺序和细节。
+2. 不要写“作者认为”“本段介绍”“这一部分说明”“视频中提到”这类总结句。
+3. 不要新增原文没有的概念、例子、判断或解释。
+4. sourceSegmentIds 必须与输入 microSegment.sourceSegmentIds 完全一致，顺序也一致。
+5. edits 只填写实际发生的轻量编辑类型，例如 remove_filler、punctuation、merge_fragments、asr_typo。
+6. 只输出 JSON，不要代码围栏。
+
+视频标题：{title}
+章节标题：{section_title}
+
+microSegment:
+{json.dumps(micro_segment, ensure_ascii=False)}
+
+sourceSegments:
+{json.dumps(source_payload, ensure_ascii=False)}""",
+            },
+        ]
+        return {
+            "model": self._settings.llm_model,
+            "messages": self._ensure_json_keyword_in_messages(messages),
+            "response_format": {"type": "json_object"},
+            "enable_thinking": False,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+
     def build_and_export_mindmap(
         self,
         task_id: str,
@@ -5905,20 +5973,13 @@ P 数索引：
             json_path = task_dir / "detailed_record.json"
             markdown_path = task_dir / "detailed_record.md"
             try:
-                if self._settings.llm_enabled and self._settings.llm_api_key:
-                    payload = self._generate_detailed_record_with_llm(transcript, segments, title, summary)
-                    record = normalize_detailed_record_payload(payload, title=title, summary=summary, segments=segments)
-                    summary["llm_prompt_tokens"] = (_safe_int(summary.get("llm_prompt_tokens")) or 0) + (
-                        _safe_int(payload.get("llm_prompt_tokens")) or 0
-                    )
-                    summary["llm_completion_tokens"] = (_safe_int(summary.get("llm_completion_tokens")) or 0) + (
-                        _safe_int(payload.get("llm_completion_tokens")) or 0
-                    )
-                    summary["llm_total_tokens"] = (_safe_int(summary.get("llm_total_tokens")) or 0) + (
-                        _safe_int(payload.get("llm_total_tokens")) or 0
-                    )
-                else:
-                    record = build_detailed_record_fallback(title=title, summary=summary, segments=segments)
+                record = build_detailed_record_from_segments(
+                    title=title,
+                    summary=summary,
+                    segments=segments,
+                    formatter_config=self._detailed_record_formatter_config(),
+                )
+                record = self._maybe_polish_detailed_record_with_llm(title=title, record=record, source_segments=segments)
                 markdown = render_detailed_record_markdown(record)
                 json_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
                 markdown_path.write_text(markdown, encoding="utf-8")
@@ -5938,7 +5999,12 @@ P 数索引：
                 artifacts["note_variant_detailed_record_json_path"] = str(json_path)
             except Exception as exc:
                 logger.warning("detailed record generation failed error=%s", exc)
-                fallback = build_detailed_record_fallback(title=title, summary=summary, segments=segments)
+                fallback = build_detailed_record_fallback(
+                    title=title,
+                    summary=summary,
+                    segments=segments,
+                    formatter_config=self._detailed_record_formatter_config(),
+                )
                 markdown = render_detailed_record_markdown(fallback)
                 json_path.write_text(json.dumps(fallback, ensure_ascii=False, indent=2), encoding="utf-8")
                 markdown_path.write_text(markdown, encoding="utf-8")
@@ -5959,6 +6025,139 @@ P 数索引：
                 artifacts["note_variant_detailed_record_path"] = str(markdown_path)
                 artifacts["note_variant_detailed_record_json_path"] = str(json_path)
         return variants, artifacts
+
+    def _detailed_record_formatter_config(self) -> DetailedRecordFormatterConfig:
+        return DetailedRecordFormatterConfig(
+            micro_min_chars=self._settings.detailed_record_micro_min_chars,
+            micro_target_chars=self._settings.detailed_record_micro_target_chars,
+            micro_max_chars=self._settings.detailed_record_micro_max_chars,
+            micro_max_duration_seconds=self._settings.detailed_record_micro_max_duration_seconds,
+        ).normalized()
+
+    def _maybe_polish_detailed_record_with_llm(
+        self,
+        *,
+        title: str,
+        record: dict[str, object],
+        source_segments: list[dict[str, object]],
+    ) -> dict[str, object]:
+        formatter = record.setdefault("formatter", {})
+        if isinstance(formatter, dict):
+            formatter["llmPolishEnabled"] = bool(self._settings.detailed_record_llm_polish_enabled)
+        if not self._settings.detailed_record_llm_polish_enabled:
+            self._mark_detailed_record_polish_status(record, "not_requested")
+            return record
+        if not (self._settings.llm_enabled and self._settings.llm_api_key and self._settings.llm_base_url and self._settings.llm_model):
+            self._mark_detailed_record_polish_status(record, "skipped", reason="llm_not_configured")
+            return record
+
+        source_by_id: dict[object, dict[str, object]] = {}
+        for index, item in enumerate(source_segments, start=1):
+            if not isinstance(item, dict):
+                continue
+            source_by_id[index] = item
+            if item.get("id") is not None:
+                source_by_id[item.get("id")] = item
+        base_url = (self._settings.llm_base_url or "").rstrip("/")
+        jobs: list[tuple[dict[str, object], str, list[dict[str, object]]]] = []
+        for section in record.get("sections") or []:
+            if not isinstance(section, dict):
+                continue
+            section_title = str(section.get("title") or "").strip()
+            for micro in section.get("microSegments") or []:
+                if not isinstance(micro, dict):
+                    continue
+                source_ids = [item for item in micro.get("sourceSegmentIds") or [] if item is not None]
+                micro_sources = [source_by_id[source_id] for source_id in source_ids if source_id in source_by_id]
+                if not micro_sources:
+                    micro["polish"] = {"provider": "llm", "status": "skipped", "reason": "missing_source_segments", "edits": []}
+                    continue
+                jobs.append((micro, section_title, micro_sources))
+        if not jobs:
+            return record
+        concurrency = max(1, min(int(self._settings.detailed_record_llm_polish_concurrency or 1), 8))
+        if concurrency == 1 or len(jobs) == 1:
+            for micro, section_title, micro_sources in jobs:
+                self._polish_detailed_record_micro(
+                    base_url=base_url,
+                    title=title,
+                    section_title=section_title,
+                    micro=micro,
+                    source_segments=micro_sources,
+                )
+            return record
+
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [
+                executor.submit(
+                    self._polish_detailed_record_micro,
+                    base_url=base_url,
+                    title=title,
+                    section_title=section_title,
+                    micro=micro,
+                    source_segments=micro_sources,
+                )
+                for micro, section_title, micro_sources in jobs
+            ]
+            for future in as_completed(futures):
+                future.result()
+        return record
+
+    def _polish_detailed_record_micro(
+        self,
+        *,
+        base_url: str,
+        title: str,
+        section_title: str,
+        micro: dict[str, object],
+        source_segments: list[dict[str, object]],
+    ) -> None:
+        try:
+            payload = self._build_llm_detailed_record_micro_polish_payload(
+                title=title,
+                section_title=section_title,
+                micro_segment=self._truncate_micro_segment_for_polish(micro),
+                source_segments=source_segments,
+            )
+            llm_result = self._request_llm_json(
+                base_url=base_url,
+                payload=payload,
+                timeout=90,
+                retry_count=max(0, int(self._settings.detailed_record_llm_polish_retry_count or 0)),
+            )
+            accepted, reason, normalized = validate_detailed_record_micro_polish(micro, llm_result)
+            if not accepted:
+                micro["polish"] = {"provider": "llm", "status": "rejected", "reason": reason, "edits": []}
+                return
+            micro["text"] = normalized["text"]
+            micro["polish"] = {
+                "provider": "llm",
+                "status": "accepted",
+                "reason": "",
+                "edits": normalized.get("edits") or [],
+            }
+        except Exception as exc:
+            logger.warning("detailed record micro polish failed micro_id=%s error=%s", micro.get("id"), exc)
+            micro["polish"] = {"provider": "llm", "status": "failed", "reason": str(exc), "edits": []}
+
+    def _mark_detailed_record_polish_status(
+        self,
+        record: dict[str, object],
+        status: str,
+        *,
+        reason: str = "",
+    ) -> None:
+        for section in record.get("sections") or []:
+            if not isinstance(section, dict):
+                continue
+            for micro in section.get("microSegments") or []:
+                if isinstance(micro, dict):
+                    micro.setdefault("polish", {"provider": "local", "status": status, "reason": reason, "edits": []})
+
+    def _truncate_micro_segment_for_polish(self, micro: dict[str, object]) -> dict[str, object]:
+        payload = dict(micro)
+        payload["text"] = _truncate_text(str(payload.get("text") or ""), max(200, int(self._settings.detailed_record_llm_polish_max_chars or 900)))
+        return payload
 
     def _export_transcript_snapshot(
         self,

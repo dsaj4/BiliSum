@@ -139,6 +139,14 @@ class SettingsUpdatePayload(BaseModel):
     mindmap_concurrency: int | None = None
     summary_chunk_concurrency: int | None = None
     summary_chunk_retry_count: int | None = None
+    detailed_record_micro_min_chars: int | None = None
+    detailed_record_micro_target_chars: int | None = None
+    detailed_record_micro_max_chars: int | None = None
+    detailed_record_micro_max_duration_seconds: int | None = None
+    detailed_record_llm_polish_enabled: bool | None = None
+    detailed_record_llm_polish_max_chars: int | None = None
+    detailed_record_llm_polish_concurrency: int | None = None
+    detailed_record_llm_polish_retry_count: int | None = None
     ytdlp_cookies_file: str | None = None
     ytdlp_cookies_browser: str | None = None
 

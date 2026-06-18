@@ -330,6 +330,43 @@ def test_update_settings_persists_visual_summary_options(tmp_path: Path) -> None
     assert "visual_frame_planning_prompt" in stored
 
 
+def test_update_settings_persists_detailed_record_formatter_options(tmp_path: Path) -> None:
+    current = ServiceSettings(
+        data_dir=tmp_path / "data",
+        cache_dir=tmp_path / "cache",
+        tasks_dir=tmp_path / "tasks",
+        runtime_channel="base",
+    )
+    settings_manager._settings = current
+    settings_manager._settings_path = tmp_path / "settings.json"
+
+    next_settings = settings_manager.save(
+        SettingsUpdatePayload(
+            detailed_record_micro_min_chars=200,
+            detailed_record_micro_target_chars=420,
+            detailed_record_micro_max_chars=760,
+            detailed_record_micro_max_duration_seconds=150,
+            detailed_record_llm_polish_enabled=True,
+            detailed_record_llm_polish_max_chars=880,
+            detailed_record_llm_polish_concurrency=3,
+            detailed_record_llm_polish_retry_count=2,
+        )
+    )
+
+    assert next_settings.detailed_record_micro_min_chars == 200
+    assert next_settings.detailed_record_micro_target_chars == 420
+    assert next_settings.detailed_record_micro_max_chars == 760
+    assert next_settings.detailed_record_micro_max_duration_seconds == 150
+    assert next_settings.detailed_record_llm_polish_enabled is True
+    assert next_settings.detailed_record_llm_polish_max_chars == 880
+    assert next_settings.detailed_record_llm_polish_concurrency == 3
+    assert next_settings.detailed_record_llm_polish_retry_count == 2
+    stored = settings_manager._settings_path.read_text(encoding="utf-8")
+    assert "detailed_record_micro_min_chars" in stored
+    assert "detailed_record_micro_max_duration_seconds" in stored
+    assert "detailed_record_llm_polish_enabled" in stored
+
+
 def test_install_local_asr_refreshes_environment(monkeypatch, tmp_path: Path) -> None:
     current = ServiceSettings(
         data_dir=tmp_path / "data",
