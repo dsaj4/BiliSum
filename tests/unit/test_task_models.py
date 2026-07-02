@@ -8,6 +8,8 @@ from video_sum_core.note_modes import (
     UnknownNoteModeError,
     build_detailed_record_from_segments,
     build_detailed_record_fallback,
+    note_mode_definition,
+    note_mode_definitions,
     normalize_detailed_record_payload,
     normalize_note_modes,
     render_detailed_record_markdown,
@@ -53,6 +55,16 @@ def test_note_modes_normalize_and_reject_unknown_values() -> None:
         normalize_note_modes(["missing_mode"])
 
 
+def test_note_mode_registry_exposes_parallel_mode_artifact_contract() -> None:
+    modes = note_mode_definitions(["knowledge_note", "detailed_record"])
+
+    assert [mode.id for mode in modes] == ["knowledge_note", "detailed_record"]
+    assert note_mode_definition("knowledge-note").artifact_stem == "knowledge_note"
+    detailed = note_mode_definition("detailed_record")
+    assert detailed.content_type == "markdown+json"
+    assert detailed.has_structured_artifact is True
+
+
 def test_task_status_values_stable() -> None:
     assert TaskStatus.QUEUED.value == "queued"
     assert TaskStatus.COMPLETED.value == "completed"
@@ -95,6 +107,8 @@ def test_service_settings_normalize_gpu_alias_to_cuda() -> None:
 def test_normalize_transcription_provider_aliases() -> None:
     assert normalize_transcription_provider("faster-whisper") == "local"
     assert normalize_transcription_provider("silicon_flow") == "siliconflow"
+    assert normalize_transcription_provider("dashscope-funasr") == "dashscope_funasr"
+    assert normalize_transcription_provider("fun-asr-flash") == "dashscope_funasr"
 
 
 def test_service_settings_supports_siliconflow_asr_defaults() -> None:
@@ -103,6 +117,14 @@ def test_service_settings_supports_siliconflow_asr_defaults() -> None:
     assert settings.transcription_provider == "siliconflow"
     assert settings.siliconflow_asr_base_url == "https://api.siliconflow.cn/v1"
     assert settings.siliconflow_asr_model == "TeleAI/TeleSpeechASR"
+
+
+def test_service_settings_supports_dashscope_funasr_defaults() -> None:
+    settings = ServiceSettings(transcription_provider="dashscope-funasr")
+
+    assert settings.transcription_provider == "dashscope_funasr"
+    assert settings.dashscope_funasr_model == "fun-asr-flash-2026-06-15"
+    assert settings.dashscope_funasr_sample_rate == 16000
 
 
 def test_service_settings_default_transcription_provider_is_siliconflow() -> None:

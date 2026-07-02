@@ -161,6 +161,149 @@ def test_summarize_emits_partial_result_payloads() -> None:
     assert summary["knowledgeNoteMarkdown"] == "# 知识笔记\n\n内容"
 
 
+def test_short_llm_knowledge_note_falls_back_to_structured_note(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = RealPipelineRunner(
+        PipelineSettings(
+            tasks_dir=tmp_path,
+            llm_enabled=True,
+            llm_api_key="test-key",
+            llm_base_url="https://example.com/v1",
+            llm_model="test-model",
+            summary_chunk_target_chars=100000,
+        )
+    )
+    segments = [
+        {
+            "start": float(index * 60),
+            "end": float(index * 60 + 30),
+            "text": f"章节 {index + 1} 的原始转写内容，包含具体操作、设置项和验证结果。",
+        }
+        for index in range(12)
+    ]
+    transcript = "\n".join(str(segment["text"]) * 90 for segment in segments)
+    chapters = [
+        {
+            "title": f"章节 {index + 1}",
+            "start": segment["start"],
+            "summary": f"章节 {index + 1} 摘要，说明这一段的核心操作和结论。",
+        }
+        for index, segment in enumerate(segments)
+    ]
+
+    def fake_llm_summary(
+        transcript: str,
+        segments: list[dict[str, object]],
+        title: str,
+        emit,
+        source_kind: str | None = None,
+    ) -> dict[str, object]:
+        return {
+            "title": title,
+            "overview": "整体概览",
+            "bulletPoints": ["要点一", "要点二", "要点三", "要点四", "要点五"],
+            "chapters": chapters,
+            "chapterGroups": [],
+        }
+
+    monkeypatch.setattr(runner, "_summarize_with_llm", fake_llm_summary)
+    monkeypatch.setattr(
+        runner,
+        "_generate_knowledge_note_with_llm",
+        lambda **_kwargs: {
+            "knowledgeNoteMarkdown": "# 知识笔记\n\n太短",
+            "llm_prompt_tokens": 12,
+            "llm_completion_tokens": 8,
+            "llm_total_tokens": 20,
+        },
+    )
+    events: list[tuple[str, int, str, dict[str, object] | None]] = []
+
+    summary = runner._summarize(
+        transcript=transcript,
+        segments=segments,
+        title="长视频示例",
+        emit=lambda stage, progress, message, payload=None: events.append((stage, progress, message, payload)),
+    )
+
+    assert summary["knowledgeNoteMarkdown"] != "# 知识笔记\n\n太短"
+    assert "## 内容展开" in str(summary["knowledgeNoteMarkdown"])
+    assert "原文线索" in str(summary["knowledgeNoteMarkdown"])
+    assert summary["knowledgeNoteMarkdownQualityFallback"]["used"] is True
+    assert "knowledge_note_low_coverage" in summary["knowledgeNoteMarkdownQualityFallback"]["reason"]
+    assert any(payload and payload.get("fallback") == "knowledge_note_quality" for _, _, _, payload in events)
+
+
+def test_llm_summary_falls_back_to_local_merge_when_aggregate_merge_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = RealPipelineRunner(
+        PipelineSettings(
+            tasks_dir=tmp_path,
+            llm_enabled=True,
+            llm_api_key="test-key",
+            llm_base_url="https://api.example.com/v1",
+            llm_model="test-model",
+            summary_chunk_target_chars=40,
+            summary_chunk_overlap_segments=0,
+            summary_chunk_concurrency=1,
+            summary_chunk_retry_count=0,
+        )
+    )
+    segments = [
+        {"start": 0.0, "end": 10.0, "text": "alpha " * 12},
+        {"start": 10.0, "end": 20.0, "text": "beta " * 12},
+        {"start": 20.0, "end": 30.0, "text": "gamma " * 12},
+    ]
+    transcript = "\n".join(str(item["text"]) for item in segments)
+    expected_chunk_count = len(runner._build_summary_chunks(segments))
+    events: list[tuple[str, int, str, dict[str, object] | None]] = []
+    calls: list[str] = []
+
+    def fake_request(*, base_url: str, payload: dict[str, object], **_kwargs: object) -> dict[str, object]:
+        if len(calls) >= expected_chunk_count:
+            raise VideoSumError(
+                'LLM returned no readable message content. response_shape={"choices_len":1,"message_content_len":0}'
+            )
+        chunk_number = len(calls) + 1
+        calls.append("chunk")
+        return {
+            "title": f"partial {chunk_number}",
+            "overview": f"overview {chunk_number}",
+            "bulletPoints": [f"point {chunk_number}"],
+            "chapters": [
+                {
+                    "title": f"chapter {chunk_number}",
+                    "start": float((chunk_number - 1) * 10),
+                    "summary": f"summary {chunk_number}",
+                }
+            ],
+            "llm_prompt_tokens": 1,
+            "llm_completion_tokens": 2,
+            "llm_total_tokens": 3,
+        }
+
+    monkeypatch.setattr(runner, "_request_llm_json", fake_request)
+
+    summary = runner._summarize_with_llm(
+        transcript=transcript,
+        segments=segments,
+        title="aggregate fallback",
+        emit=lambda stage, progress, message, payload=None: events.append((stage, progress, message, payload)),
+    )
+
+    assert summary["overview"]
+    assert summary["bulletPoints"]
+    assert summary["chapters"]
+    assert summary["llmAggregateMergeFallback"]["used"] is True
+    assert "response_shape" in summary["llmAggregateMergeFallback"]["reason"]
+    assert summary["llm_prompt_tokens"] == len(calls)
+    assert any(payload and payload.get("fallback") == "local_structured_merge" for _, _, _, payload in events)
+
+
 def test_build_fallback_segments_from_transcript_preserves_order() -> None:
     runner = RealPipelineRunner(PipelineSettings(tasks_dir=Path("tests/tmp_tasks")))
 
@@ -254,6 +397,111 @@ def test_transcribe_uses_multimodal_provider(monkeypatch: pytest.MonkeyPatch) ->
     assert segments[0]["text"] == "mock"
     assert called["audio_path"] == Path("sample.mp3")
     assert called["duration"] == 12.0
+
+
+def test_transcribe_uses_dashscope_funasr_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = RealPipelineRunner(
+        PipelineSettings(
+            tasks_dir=Path("tests/tmp_tasks"),
+            transcription_provider="dashscope_funasr",
+            dashscope_funasr_api_key="test-key",
+        )
+    )
+
+    called: dict[str, object] = {}
+
+    def fake_dashscope(
+        audio_path: Path,
+        duration: float | None,
+        emit,
+    ) -> tuple[str, list[dict[str, object]]]:
+        called["audio_path"] = audio_path
+        called["duration"] = duration
+        return "mock transcript", [{"start": 0.0, "end": 5.0, "text": "mock"}]
+
+    monkeypatch.setattr(runner, "_transcribe_with_dashscope_funasr", fake_dashscope)
+
+    transcript, segments = runner._transcribe(Path("sample.mp3"), 12.0, lambda *_args, **_kwargs: None)
+
+    assert transcript == "mock transcript"
+    assert segments[0]["text"] == "mock"
+    assert called["audio_path"] == Path("sample.mp3")
+    assert called["duration"] == 12.0
+
+
+def test_transcribe_with_dashscope_funasr_parses_sse_response(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runner = RealPipelineRunner(
+        PipelineSettings(
+            tasks_dir=tmp_path,
+            transcription_provider="dashscope_funasr",
+            dashscope_funasr_endpoint="https://dashscope.example/generation",
+            dashscope_funasr_api_key="test-key",
+            dashscope_funasr_sample_rate=16000,
+        )
+    )
+    audio_path = tmp_path / "sample.mp3"
+    audio_path.write_bytes(b"fake audio")
+    ffmpeg_exe = tmp_path / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+    ffmpeg_exe.write_text("", encoding="utf-8")
+    posted: dict[str, object] = {}
+
+    class FakeCompletedProcess:
+        stdout = ""
+        stderr = ""
+        returncode = 0
+
+    def fake_run(command, *args, **kwargs):
+        chunk_path = Path(command[-1])
+        chunk_path.write_bytes(b"fake wav")
+        return FakeCompletedProcess()
+
+    class FakeResponse:
+        status_code = 200
+        text = (
+            'id:1\nevent:result\ndata:{"sentence":{"sentence_id":1,'
+            '"begin_time":760,"end_time":3800,'
+            '"text":"Hello World，这里是阿里巴巴语音实验室。"},'
+            '"text":"Hello World，这里是阿里巴巴语音实验室。"}\n'
+        )
+
+        def json(self) -> dict[str, object]:
+            return {}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def post(self, url, headers=None, json=None) -> FakeResponse:
+            posted["url"] = url
+            posted["headers"] = headers or {}
+            posted["json"] = json or {}
+            return FakeResponse()
+
+    monkeypatch.setattr("video_sum_core.pipeline.real.ffmpeg_location", lambda: ffmpeg_exe)
+    monkeypatch.setattr("video_sum_core.pipeline.real.subprocess.run", fake_run)
+    monkeypatch.setattr("video_sum_core.pipeline.real.httpx.Client", FakeClient)
+
+    transcript, segments = runner._transcribe_with_dashscope_funasr(
+        audio_path,
+        4.0,
+        lambda *_args, **_kwargs: None,
+    )
+
+    assert posted["url"] == "https://dashscope.example/generation"
+    payload = posted["json"]
+    assert payload["model"] == "fun-asr-flash-2026-06-15"
+    assert payload["parameters"] == {"format": "wav", "sample_rate": "16000"}
+    assert "Hello World" in transcript
+    assert segments == [{"start": 0.76, "end": 3.8, "text": "Hello World，这里是阿里巴巴语音实验室。"}]
 
 
 def test_transcribe_with_multimodal_uses_configured_ffmpeg_for_chunking(

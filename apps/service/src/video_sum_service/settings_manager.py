@@ -28,6 +28,7 @@ from video_sum_infra.config import (
 SECRET_SETTINGS_FIELDS = {
     "siliconflow_asr_api_key",
     "multimodal_asr_api_key",
+    "dashscope_funasr_api_key",
     "llm_api_key",
     "knowledge_llm_api_key",
     "siliconflow_embedding_api_key",
@@ -68,6 +69,12 @@ class SettingsUpdatePayload(BaseModel):
     multimodal_asr_api_key: str | None = None
     multimodal_asr_chunk_duration_seconds: int | None = None
     multimodal_asr_max_retries: int | None = None
+    dashscope_funasr_endpoint: str | None = None
+    dashscope_funasr_model: str | None = None
+    dashscope_funasr_api_key: str | None = None
+    dashscope_funasr_chunk_duration_seconds: int | None = None
+    dashscope_funasr_max_retries: int | None = None
+    dashscope_funasr_sample_rate: int | None = None
     funasr_model: str | None = None
     funasr_device: str | None = None
     funasr_vad_model: str | None = None

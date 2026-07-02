@@ -58,12 +58,13 @@ from video_sum_core.note_modes import (
     DetailedRecordFormatterConfig,
     KNOWLEDGE_NOTE_MODE,
     NOTE_MODE_REGISTRY,
+    NoteModeDefinition,
     build_detailed_record_from_segments,
     build_detailed_record_fallback,
     detailed_record_quality,
+    note_mode_definitions,
     normalize_note_modes,
     normalize_primary_note_mode,
-    note_mode_definition,
     render_detailed_record_markdown,
     validate_detailed_record_micro_polish,
 )
@@ -159,6 +160,63 @@ def _extract_response_error_detail(response: httpx.Response) -> str:
     return _truncate_text(json.dumps(payload, ensure_ascii=False), 400)
 
 
+def _summarize_llm_response_shape(payload: object) -> dict[str, object]:
+    diagnostics: dict[str, object] = {"payload_type": type(payload).__name__}
+    if not isinstance(payload, dict):
+        diagnostics["preview"] = _truncate_text(str(payload), 240)
+        return diagnostics
+
+    diagnostics["top_keys"] = sorted(str(key) for key in payload.keys())
+    usage = payload.get("usage")
+    if isinstance(usage, dict):
+        diagnostics["usage"] = {
+            str(key): value
+            for key, value in usage.items()
+            if isinstance(value, int | float | str | bool) or value is None
+        }
+    error = payload.get("error")
+    if isinstance(error, dict):
+        diagnostics["error_keys"] = sorted(str(key) for key in error.keys())
+        diagnostics["error_message"] = _truncate_text(str(error.get("message") or ""), 240)
+        diagnostics["error_code"] = error.get("code")
+    elif error is not None:
+        diagnostics["error_type"] = type(error).__name__
+        diagnostics["error_preview"] = _truncate_text(str(error), 240)
+
+    choices = payload.get("choices")
+    diagnostics["choices_type"] = type(choices).__name__
+    if not isinstance(choices, list):
+        return diagnostics
+    diagnostics["choices_len"] = len(choices)
+    if not choices or not isinstance(choices[0], dict):
+        return diagnostics
+
+    first = choices[0]
+    diagnostics["first_choice_keys"] = sorted(str(key) for key in first.keys())
+    diagnostics["finish_reason"] = first.get("finish_reason")
+    text = first.get("text")
+    if isinstance(text, str):
+        diagnostics["choice_text_len"] = len(text.strip())
+        diagnostics["choice_text_preview"] = _truncate_text(text.strip(), 240)
+
+    message = first.get("message")
+    diagnostics["message_type"] = type(message).__name__
+    if not isinstance(message, dict):
+        return diagnostics
+
+    diagnostics["message_keys"] = sorted(str(key) for key in message.keys())
+    content = message.get("content")
+    diagnostics["message_content_type"] = type(content).__name__
+    if isinstance(content, str):
+        diagnostics["message_content_len"] = len(content.strip())
+        diagnostics["message_content_preview"] = _truncate_text(content.strip(), 240)
+    reasoning = message.get("reasoning_content")
+    if isinstance(reasoning, str):
+        diagnostics["reasoning_content_len"] = len(reasoning.strip())
+        diagnostics["reasoning_content_preview"] = _truncate_text(reasoning.strip(), 240)
+    return diagnostics
+
+
 def _extract_json_object_text(value: str) -> str:
     text = str(value or "").strip()
     if text.startswith("```"):
@@ -217,6 +275,12 @@ class PipelineSettings:
     multimodal_asr_api_key: str = ""
     multimodal_asr_chunk_duration_seconds: int = 180
     multimodal_asr_max_retries: int = 5
+    dashscope_funasr_endpoint: str = "https://llm-nv7r2rp4wj9l7cn8.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+    dashscope_funasr_model: str = "fun-asr-flash-2026-06-15"
+    dashscope_funasr_api_key: str = ""
+    dashscope_funasr_chunk_duration_seconds: int = 240
+    dashscope_funasr_max_retries: int = 3
+    dashscope_funasr_sample_rate: int = 16000
     funasr_model: str = "paraformer-zh"
     funasr_device: str = "cpu"
     funasr_vad_model: str = "fsmn-vad"
@@ -1024,6 +1088,8 @@ class RealPipelineRunner(PipelineRunner):
             return self._transcribe_with_siliconflow(audio_path, duration, emit)
         if provider == "multimodal":
             return self._transcribe_with_multimodal(audio_path, duration, emit)
+        if provider == "dashscope_funasr":
+            return self._transcribe_with_dashscope_funasr(audio_path, duration, emit)
         if provider == "funasr":
             return self._transcribe_with_funasr(audio_path, duration, emit)
         return self._transcribe_with_local_whisper(audio_path, duration, emit)
@@ -1517,6 +1583,281 @@ class RealPipelineRunner(PipelineRunner):
             {"provider": "multimodal", "segment_count": len(segments)},
         )
         return self._render_transcript_from_segments(segments), segments
+
+    def _probe_audio_duration(self, audio_path: Path) -> float:
+        ffmpeg_exe = ffmpeg_location()
+        ffprobe_exe = None
+        if ffmpeg_exe is not None:
+            ffprobe_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+            ffprobe_exe = ffmpeg_exe.parent / ffprobe_name
+        if ffprobe_exe is None or not ffprobe_exe.is_file():
+            ffprobe_which = shutil.which("ffprobe")
+            if ffprobe_which:
+                ffprobe_exe = Path(ffprobe_which)
+        if ffprobe_exe is None or not ffprobe_exe.is_file():
+            return 0.0
+        try:
+            result = subprocess.run(
+                [
+                    str(ffprobe_exe),
+                    "-v",
+                    "quiet",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "csv=p=0",
+                    str(audio_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+                **_windows_hidden_subprocess_kwargs(),
+            )
+            if result.returncode == 0:
+                return max(0.0, float(result.stdout.strip()))
+        except Exception:
+            return 0.0
+        return 0.0
+
+    def _transcribe_with_dashscope_funasr(
+        self,
+        audio_path: Path,
+        duration: float | None,
+        emit: Callable[[str, int, str, dict[str, object] | None], None],
+    ) -> tuple[str, list[dict[str, object]]]:
+        import tempfile
+
+        endpoint = (self._settings.dashscope_funasr_endpoint or "").strip()
+        model_name = (self._settings.dashscope_funasr_model or "").strip()
+        api_key = (self._settings.dashscope_funasr_api_key or "").strip()
+        if not endpoint:
+            raise TranscriptionConfigurationError("DashScope FunASR endpoint is not configured.")
+        if not model_name:
+            raise TranscriptionConfigurationError("DashScope FunASR model is not configured.")
+        if not api_key:
+            raise TranscriptionConfigurationError("DashScope FunASR API key is not configured.")
+
+        ffmpeg_exe = ffmpeg_location()
+        if ffmpeg_exe is None:
+            raise VideoSumError("FFmpeg is unavailable, cannot prepare audio for DashScope FunASR.")
+
+        sample_rate = max(8000, int(self._settings.dashscope_funasr_sample_rate or 16000))
+        chunk_duration = min(300, max(30, int(self._settings.dashscope_funasr_chunk_duration_seconds or 240)))
+        max_retries = max(1, int(self._settings.dashscope_funasr_max_retries or 3))
+        total_duration = float(duration or 0)
+        if total_duration <= 0:
+            total_duration = self._probe_audio_duration(audio_path)
+
+        if total_duration > 0:
+            num_chunks = max(1, int(math.ceil(total_duration / chunk_duration)))
+        else:
+            num_chunks = 1
+
+        emit(
+            "transcribing",
+            52,
+            f"正在连接 DashScope FunASR {model_name}",
+            {"provider": "dashscope_funasr", "model": model_name, "chunks": num_chunks},
+        )
+
+        def _parse_sse_result(content: str) -> tuple[str, list[dict[str, object]]]:
+            transcript_parts: list[str] = []
+            segments: list[dict[str, object]] = []
+            seen_sentence_ids: set[str] = set()
+            last_text = ""
+
+            for raw_line in content.splitlines():
+                line = raw_line.strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    payload = json.loads(data)
+                except ValueError:
+                    logger.warning("dashscope funasr returned non-json sse data: %s", _truncate_text(data, 240))
+                    continue
+
+                if not isinstance(payload, dict):
+                    continue
+                text = str(payload.get("text") or "").strip()
+                if text:
+                    last_text = text
+
+                sentence = payload.get("sentence")
+                output = payload.get("output")
+                if not isinstance(sentence, dict) and isinstance(output, dict):
+                    candidate = output.get("sentence")
+                    if isinstance(candidate, dict):
+                        sentence = candidate
+                if not isinstance(sentence, dict):
+                    continue
+
+                sentence_text = str(sentence.get("text") or "").strip()
+                if not sentence_text:
+                    continue
+                sentence_id = str(sentence.get("sentence_id") or len(segments) + 1)
+                begin = sentence.get("begin_time")
+                end = sentence.get("end_time")
+                dedupe_key = f"{sentence_id}:{begin}:{end}:{sentence_text}"
+                if dedupe_key in seen_sentence_ids:
+                    continue
+                seen_sentence_ids.add(dedupe_key)
+                transcript_parts.append(sentence_text)
+                if isinstance(begin, int | float) and isinstance(end, int | float):
+                    segments.append(
+                        {
+                            "start": round(float(begin) / 1000.0, 3),
+                            "end": round(float(end) / 1000.0, 3),
+                            "text": sentence_text,
+                        }
+                    )
+
+            transcript = "\n".join(part for part in transcript_parts if part).strip()
+            if not transcript:
+                transcript = last_text
+            return transcript, segments
+
+        def _encode_chunk(source_path: Path, target_path: Path, offset: float | None, length: float | None) -> None:
+            command = [str(ffmpeg_exe), "-y"]
+            if offset is not None and offset > 0:
+                command.extend(["-ss", str(offset)])
+            command.extend(["-i", str(source_path)])
+            if length is not None and length > 0:
+                command.extend(["-t", str(length)])
+            command.extend(["-ac", "1", "-ar", str(sample_rate), "-f", "wav", str(target_path)])
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=180,
+                check=False,
+                **_windows_hidden_subprocess_kwargs(),
+            )
+            if result.returncode != 0 or not target_path.exists() or target_path.stat().st_size == 0:
+                detail = _truncate_text(result.stderr.strip() or result.stdout.strip(), 400)
+                raise VideoSumError(f"DashScope FunASR audio preparation failed: {detail}")
+
+        def _send_chunk(chunk_path: Path, chunk_offset: float, chunk_index: int) -> tuple[str, list[dict[str, object]]]:
+            data = base64.b64encode(chunk_path.read_bytes()).decode("ascii")
+            payload = {
+                "model": model_name,
+                "input": {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_audio",
+                                    "input_audio": {
+                                        "data": f"data:audio/wav;base64,{data}",
+                                    },
+                                }
+                            ],
+                        }
+                    ]
+                },
+                "parameters": {
+                    "format": "wav",
+                    "sample_rate": str(sample_rate),
+                },
+            }
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "X-DashScope-SSE": "enable",
+            }
+
+            last_error: Exception | None = None
+            for attempt in range(max_retries):
+                if attempt > 0:
+                    time.sleep(2 * attempt)
+                try:
+                    timeout = httpx.Timeout(connect=30.0, read=600.0, write=600.0, pool=30.0)
+                    with httpx.Client(timeout=timeout) as client:
+                        response = client.post(endpoint, headers=headers, json=payload)
+                    if response.status_code in {401, 403}:
+                        detail = _extract_response_error_detail(response)
+                        raise TranscriptionAuthenticationError(f"DashScope FunASR authentication failed: {detail}")
+                    if response.status_code >= 400:
+                        detail = _extract_response_error_detail(response)
+                        raise VideoSumError(f"DashScope FunASR request failed: {detail}")
+                    transcript, parsed_segments = _parse_sse_result(response.text)
+                    if transcript:
+                        adjusted_segments = [
+                            {
+                                "start": round(float(segment["start"]) + chunk_offset, 3),
+                                "end": round(float(segment["end"]) + chunk_offset, 3),
+                                "text": str(segment["text"]),
+                            }
+                            for segment in parsed_segments
+                            if "start" in segment and "end" in segment and "text" in segment
+                        ]
+                        return transcript, adjusted_segments
+                    last_error = VideoSumError("DashScope FunASR returned empty transcript text.")
+                except TranscriptionAuthenticationError:
+                    raise
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning(
+                        "dashscope funasr chunk %d/%d failed attempt=%d/%d: %s",
+                        chunk_index + 1,
+                        num_chunks,
+                        attempt + 1,
+                        max_retries,
+                        exc,
+                    )
+
+            if isinstance(last_error, VideoSumError):
+                raise last_error
+            raise VideoSumError(f"DashScope FunASR request failed: {last_error}")
+
+        all_transcripts: list[tuple[float, str]] = []
+        all_segments: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            for index in range(num_chunks):
+                chunk_offset = float(index * chunk_duration)
+                remaining = max(0.0, total_duration - chunk_offset) if total_duration > 0 else 0.0
+                chunk_length = min(float(chunk_duration), remaining) if remaining > 0 else None
+                chunk_path = tmp_path / f"dashscope_funasr_{index:03d}.wav"
+                emit(
+                    "transcribing",
+                    55 + int(22 * index / max(1, num_chunks)),
+                    f"正在识别音频片段 {index + 1}/{num_chunks}",
+                    {"provider": "dashscope_funasr", "chunk": index + 1, "total": num_chunks},
+                )
+                _encode_chunk(audio_path, chunk_path, chunk_offset if num_chunks > 1 else None, chunk_length)
+                transcript, segments = _send_chunk(chunk_path, chunk_offset, index)
+                all_transcripts.append((chunk_offset, transcript))
+                if segments:
+                    all_segments.extend(segments)
+                else:
+                    fallback_duration = chunk_length or total_duration or 1.0
+                    for segment in self._build_fallback_segments_from_transcript(transcript, fallback_duration):
+                        all_segments.append(
+                            {
+                                "start": round(float(segment["start"]) + chunk_offset, 3),
+                                "end": round(float(segment["end"]) + chunk_offset, 3),
+                                "text": str(segment["text"]),
+                            }
+                        )
+
+        full_transcript = "\n".join(text for _, text in all_transcripts if text).strip()
+        if not full_transcript:
+            raise VideoSumError("DashScope FunASR returned empty transcript text.")
+        if not all_segments:
+            all_segments = self._build_fallback_segments_from_transcript(full_transcript, total_duration or 1.0)
+
+        emit(
+            "transcribing",
+            84,
+            f"DashScope FunASR 转写完成，共整理 {len(all_segments)} 段",
+            {"provider": "dashscope_funasr", "segment_count": len(all_segments), "transcript_chars": len(full_transcript)},
+        )
+        return self._render_transcript_from_segments(all_segments), all_segments
 
     def _transcribe_with_funasr(
         self,
@@ -2304,6 +2645,36 @@ class RealPipelineRunner(PipelineRunner):
                 )
                 knowledge_note_markdown = str(note_payload.get("knowledgeNoteMarkdown") or "").strip()
                 if knowledge_note_markdown:
+                    quality_issue = self._knowledge_note_quality_issue(knowledge_note_markdown, summary, transcript)
+                    if quality_issue:
+                        local_note_markdown = self._build_knowledge_note_markdown(
+                            title=str(summary.get("title") or title),
+                            overview=str(summary.get("overview") or ""),
+                            bullet_points=self._coerce_bullet_points(summary.get("bulletPoints")),
+                            chapters=self._coerce_chapters(summary.get("chapters"), segments),
+                            transcript=transcript,
+                            segments=segments,
+                        )
+                        if len(local_note_markdown) > len(knowledge_note_markdown):
+                            logger.warning(
+                                "knowledge note llm output failed quality check, fallback to local note builder reason=%s",
+                                quality_issue,
+                            )
+                            emit(
+                                "summarizing",
+                                97,
+                                "知识笔记覆盖不足，已回退为本地结构化笔记",
+                                {"fallback": "knowledge_note_quality", "reason": quality_issue},
+                            )
+                            summary["knowledgeNoteMarkdownQualityFallback"] = {
+                                "used": True,
+                                "reason": quality_issue,
+                                "llm_markdown_chars": len(knowledge_note_markdown),
+                                "local_markdown_chars": len(local_note_markdown),
+                                "chapter_count": len(self._coerce_chapters(summary.get("chapters"), segments)),
+                                "transcript_chars": len(transcript),
+                            }
+                            knowledge_note_markdown = local_note_markdown
                     summary["knowledgeNoteMarkdown"] = knowledge_note_markdown
                 summary["llm_prompt_tokens"] = (_safe_int(summary.get("llm_prompt_tokens")) or 0) + (
                     _safe_int(note_payload.get("llm_prompt_tokens")) or 0
@@ -2470,16 +2841,33 @@ class RealPipelineRunner(PipelineRunner):
             len(aggregate_segments),
             len(merged_chapters),
         )
-        merged = self._request_llm_json(
-            base_url=base_url,
-            payload=self._build_llm_summary_payload(
-                title=title,
-                transcript_excerpt=aggregate_transcript,
-                segments_excerpt=aggregate_segments,
-                system_prompt_override=system_prompt_override,
-                user_prompt_override=user_prompt_override,
-            ),
-        )
+        aggregate_merge_error = ""
+        try:
+            merged = self._request_llm_json(
+                base_url=base_url,
+                payload=self._build_llm_summary_payload(
+                    title=title,
+                    transcript_excerpt=aggregate_transcript,
+                    segments_excerpt=aggregate_segments,
+                    system_prompt_override=system_prompt_override,
+                    user_prompt_override=user_prompt_override,
+                ),
+            )
+        except VideoSumError as exc:
+            aggregate_merge_error = str(exc)
+            logger.warning(
+                "llm summary aggregate merge failed, falling back to local structured merge model=%s chunk_count=%d error=%s",
+                self._settings.llm_model,
+                chunk_count,
+                exc,
+            )
+            emit(
+                "summarizing",
+                94,
+                f"分块摘要合并失败，已回退为本地结构化合并：{exc}",
+                {"fallback": "local_structured_merge", "reason": str(exc), "chunk_count": chunk_count},
+            )
+            merged = {}
         merged = self._merge_structured_summary(
             merged=merged,
             partial_summaries=partial_summaries,
@@ -2491,6 +2879,16 @@ class RealPipelineRunner(PipelineRunner):
         if failures:
             merged.setdefault("overview", "")
             merged["overview"] = f"{merged['overview']}\n\n注意：有 {len(failures)} 个分块摘要失败，最终结果基于成功分块汇总。".strip()
+        if aggregate_merge_error:
+            merged.setdefault("overview", "")
+            merged["overview"] = (
+                f"{merged['overview']}\n\n注意：LLM 分块摘要合并失败，已使用本地结构化合并兜底。"
+            ).strip()
+            merged["llmAggregateMergeFallback"] = {
+                "used": True,
+                "reason": aggregate_merge_error,
+                "chunkCount": chunk_count,
+            }
         merged["llm_prompt_tokens"] = total_prompt_tokens + (_safe_int(merged.get("llm_prompt_tokens")) or 0)
         merged["llm_completion_tokens"] = total_completion_tokens + (_safe_int(merged.get("llm_completion_tokens")) or 0)
         merged["llm_total_tokens"] = total_tokens + (_safe_int(merged.get("llm_total_tokens")) or 0)
@@ -2674,7 +3072,11 @@ class RealPipelineRunner(PipelineRunner):
         content = extract_llm_message_content(response_json)
         if content:
             return content
-        raise VideoSumError("LLM returned no readable message content.")
+        diagnostics = _summarize_llm_response_shape(response_json)
+        logger.error("llm response missing readable content diagnostics=%s", json.dumps(diagnostics, ensure_ascii=False))
+        raise VideoSumError(
+            f"LLM returned no readable message content. response_shape={json.dumps(diagnostics, ensure_ascii=False)}"
+        )
 
     def _preflight_llm_availability(self) -> None:
         base_url = (self._settings.llm_base_url or "").rstrip("/")
@@ -5196,9 +5598,33 @@ sourceSegments:
                 bullet_points=bullet_points,
                 chapters=chapters,
                 transcript=transcript,
+                segments=segments,
             )
         normalized["knowledgeNoteMarkdown"] = knowledge_note_markdown
         return normalized
+
+    def _knowledge_note_quality_issue(
+        self,
+        markdown: str,
+        summary: dict[str, object],
+        transcript: str,
+    ) -> str:
+        markdown_chars = len(markdown.strip())
+        transcript_chars = len(transcript.strip())
+        chapters_value = summary.get("chapters")
+        chapter_count = len(chapters_value) if isinstance(chapters_value, list) else 0
+        if transcript_chars < 8000 or chapter_count < 8:
+            return ""
+        min_chars = max(3500, chapter_count * 220)
+        if markdown_chars < min_chars and markdown_chars < int(transcript_chars * 0.22):
+            return (
+                "knowledge_note_low_coverage:"
+                f" markdown_chars={markdown_chars},"
+                f" min_chars={min_chars},"
+                f" transcript_chars={transcript_chars},"
+                f" chapter_count={chapter_count}"
+            )
+        return ""
 
     def _build_knowledge_note_markdown(
         self,
@@ -5207,6 +5633,7 @@ sourceSegments:
         bullet_points: list[str],
         chapters: list[dict[str, object]],
         transcript: str,
+        segments: list[dict[str, object]] | None = None,
     ) -> str:
         sections: list[str] = [f"# {title or '知识笔记'}"]
 
@@ -5223,6 +5650,9 @@ sourceSegments:
                 chapter_title = str(chapter.get("title") or f"章节 {index}").strip()
                 chapter_summary = str(chapter.get("summary") or "").strip()
                 start = float(chapter.get("start") or 0)
+                next_start = None
+                if index < len(chapters):
+                    next_start = float(chapters[index].get("start") or 0)
                 sections.extend(
                     [
                         "",
@@ -5233,6 +5663,9 @@ sourceSegments:
                 )
                 if chapter_summary:
                     sections.extend(["", chapter_summary])
+                source_excerpt = self._build_chapter_source_excerpt(chapter, next_start, segments or [])
+                if source_excerpt:
+                    sections.extend(["", "原文线索：", "", f"> {source_excerpt}"])
 
         transcript_lines = [line.strip() for line in transcript.splitlines() if line.strip()]
         if transcript_lines:
@@ -5243,6 +5676,36 @@ sourceSegments:
                 sections.extend(["", "> ..."])
 
         return "\n".join(sections).strip()
+
+    def _build_chapter_source_excerpt(
+        self,
+        chapter: dict[str, object],
+        next_start: float | None,
+        segments: list[dict[str, object]],
+    ) -> str:
+        if not segments:
+            return ""
+        start = float(chapter.get("start") or 0)
+        end_value = chapter.get("end")
+        end = float(end_value) if end_value is not None else None
+        if end is None and next_start is not None and next_start > start:
+            end = next_start
+        if end is None or end <= start:
+            end = start + 240
+
+        texts: list[str] = []
+        for segment in segments:
+            segment_start = float(segment.get("start") or 0)
+            if segment_start < start:
+                continue
+            if segment_start >= end:
+                break
+            text = str(segment.get("text") or "").strip()
+            if text:
+                texts.append(text)
+            if sum(len(item) for item in texts) >= 260:
+                break
+        return " ".join(texts).strip()[:320]
 
     def _build_overview_fallback(self, transcript: str) -> str:
         lines = [line.strip() for line in transcript.splitlines() if line.strip()]
@@ -5954,77 +6417,109 @@ sourceSegments:
     ) -> tuple[list[NoteVariant], dict[str, str]]:
         variants: list[NoteVariant] = []
         artifacts: dict[str, str] = {}
-        knowledge_note_markdown = str(summary.get("knowledgeNoteMarkdown") or "").strip()
-        if KNOWLEDGE_NOTE_MODE in note_modes:
-            definition = note_mode_definition(KNOWLEDGE_NOTE_MODE)
-            variants.append(
-                NoteVariant(
-                    id=definition.id,
-                    label=definition.label,
-                    markdown=knowledge_note_markdown,
-                    artifact_path=str(knowledge_note_path),
-                    quality={"markdown_chars": len(knowledge_note_markdown)},
-                )
+        for definition in note_mode_definitions(note_modes):
+            variant, variant_artifacts = self._export_note_variant(
+                definition=definition,
+                task_dir=task_dir,
+                title=title,
+                transcript=transcript,
+                segments=segments,
+                summary=summary,
+                knowledge_note_path=knowledge_note_path,
             )
-            artifacts["note_variant_knowledge_note_path"] = str(knowledge_note_path)
-
-        if DETAILED_RECORD_MODE in note_modes:
-            definition = note_mode_definition(DETAILED_RECORD_MODE)
-            json_path = task_dir / "detailed_record.json"
-            markdown_path = task_dir / "detailed_record.md"
-            try:
-                record = build_detailed_record_from_segments(
-                    title=title,
-                    summary=summary,
-                    segments=segments,
-                    formatter_config=self._detailed_record_formatter_config(),
-                )
-                record = self._maybe_polish_detailed_record_with_llm(title=title, record=record, source_segments=segments)
-                markdown = render_detailed_record_markdown(record)
-                json_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-                markdown_path.write_text(markdown, encoding="utf-8")
-                variants.append(
-                    NoteVariant(
-                        id=definition.id,
-                        label=definition.label,
-                        markdown=markdown,
-                        artifact_path=str(markdown_path),
-                        structured_artifact_path=str(json_path),
-                        content_type="markdown+json",
-                        structured=record,
-                        quality=detailed_record_quality(record),
-                    )
-                )
-                artifacts["note_variant_detailed_record_path"] = str(markdown_path)
-                artifacts["note_variant_detailed_record_json_path"] = str(json_path)
-            except Exception as exc:
-                logger.warning("detailed record generation failed error=%s", exc)
-                fallback = build_detailed_record_fallback(
-                    title=title,
-                    summary=summary,
-                    segments=segments,
-                    formatter_config=self._detailed_record_formatter_config(),
-                )
-                markdown = render_detailed_record_markdown(fallback)
-                json_path.write_text(json.dumps(fallback, ensure_ascii=False, indent=2), encoding="utf-8")
-                markdown_path.write_text(markdown, encoding="utf-8")
-                variants.append(
-                    NoteVariant(
-                        id=definition.id,
-                        label=definition.label,
-                        status="partial",
-                        markdown=markdown,
-                        artifact_path=str(markdown_path),
-                        structured_artifact_path=str(json_path),
-                        content_type="markdown+json",
-                        structured=fallback,
-                        error_message=str(exc),
-                        quality=detailed_record_quality(fallback),
-                    )
-                )
-                artifacts["note_variant_detailed_record_path"] = str(markdown_path)
-                artifacts["note_variant_detailed_record_json_path"] = str(json_path)
+            if variant is not None:
+                variants.append(variant)
+            artifacts.update(variant_artifacts)
         return variants, artifacts
+
+    def _export_note_variant(
+        self,
+        *,
+        definition: NoteModeDefinition,
+        task_dir: Path,
+        title: str,
+        transcript: str,
+        segments: list[dict[str, object]],
+        summary: dict[str, object],
+        knowledge_note_path: Path,
+    ) -> tuple[NoteVariant | None, dict[str, str]]:
+        if definition.id == KNOWLEDGE_NOTE_MODE:
+            return self._export_knowledge_note_variant(definition, summary, knowledge_note_path)
+        if definition.id == DETAILED_RECORD_MODE:
+            return self._export_detailed_record_variant(definition, task_dir, title, segments, summary)
+        logger.warning("skip registered note mode without exporter mode=%s transcript_chars=%d", definition.id, len(transcript))
+        return None, {}
+
+    def _export_knowledge_note_variant(
+        self,
+        definition: NoteModeDefinition,
+        summary: dict[str, object],
+        knowledge_note_path: Path,
+    ) -> tuple[NoteVariant, dict[str, str]]:
+        knowledge_note_markdown = str(summary.get("knowledgeNoteMarkdown") or "").strip()
+        return (
+            NoteVariant(
+                id=definition.id,
+                label=definition.label,
+                markdown=knowledge_note_markdown,
+                artifact_path=str(knowledge_note_path),
+                content_type=definition.content_type,
+                quality={"markdown_chars": len(knowledge_note_markdown)},
+            ),
+            {f"note_variant_{definition.artifact_stem}_path": str(knowledge_note_path)},
+        )
+
+    def _export_detailed_record_variant(
+        self,
+        definition: NoteModeDefinition,
+        task_dir: Path,
+        title: str,
+        segments: list[dict[str, object]],
+        summary: dict[str, object],
+    ) -> tuple[NoteVariant, dict[str, str]]:
+        json_path = task_dir / f"{definition.artifact_stem}.json"
+        markdown_path = task_dir / f"{definition.artifact_stem}.md"
+        try:
+            record = build_detailed_record_from_segments(
+                title=title,
+                summary=summary,
+                segments=segments,
+                formatter_config=self._detailed_record_formatter_config(),
+            )
+            record = self._maybe_polish_detailed_record_with_llm(title=title, record=record, source_segments=segments)
+            status = "ready"
+            error_message = None
+        except Exception as exc:
+            logger.warning("detailed record generation failed error=%s", exc)
+            record = build_detailed_record_fallback(
+                title=title,
+                summary=summary,
+                segments=segments,
+                formatter_config=self._detailed_record_formatter_config(),
+            )
+            status = "partial"
+            error_message = str(exc)
+        markdown = render_detailed_record_markdown(record)
+        json_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        markdown_path.write_text(markdown, encoding="utf-8")
+        return (
+            NoteVariant(
+                id=definition.id,
+                label=definition.label,
+                status=status,
+                markdown=markdown,
+                artifact_path=str(markdown_path),
+                structured_artifact_path=str(json_path),
+                content_type=definition.content_type,
+                structured=record,
+                error_message=error_message,
+                quality=detailed_record_quality(record),
+            ),
+            {
+                f"note_variant_{definition.artifact_stem}_path": str(markdown_path),
+                f"note_variant_{definition.artifact_stem}_json_path": str(json_path),
+            },
+        )
 
     def _detailed_record_formatter_config(self) -> DetailedRecordFormatterConfig:
         return DetailedRecordFormatterConfig(

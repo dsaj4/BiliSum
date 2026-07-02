@@ -376,6 +376,12 @@ TRANSCRIPTION_PROVIDER_ALIASES = {
     "qwenasr": "funasr",
     "qwen-asr": "funasr",
     "paraformer": "funasr",
+    "dashscope_funasr": "dashscope_funasr",
+    "dashscope-funasr": "dashscope_funasr",
+    "online-funasr": "dashscope_funasr",
+    "online_funasr": "dashscope_funasr",
+    "fun-asr-flash": "dashscope_funasr",
+    "fun_asr_flash": "dashscope_funasr",
 }
 
 KNOWLEDGE_LLM_MODE_ALIASES = {
@@ -509,7 +515,7 @@ def recommend_task_concurrency(settings: "ServiceSettings", *, cuda_available: b
     if whisper_device == "cuda":
         return 2
 
-    if provider == "siliconflow":
+    if provider in {"siliconflow", "dashscope_funasr"}:
         return 2
     return 1
 
@@ -551,6 +557,12 @@ class ServiceSettings(BaseSettings):
     multimodal_asr_api_key: str = ""
     multimodal_asr_chunk_duration_seconds: int = 180
     multimodal_asr_max_retries: int = 5
+    dashscope_funasr_endpoint: str = "https://llm-nv7r2rp4wj9l7cn8.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+    dashscope_funasr_model: str = "fun-asr-flash-2026-06-15"
+    dashscope_funasr_api_key: str = ""
+    dashscope_funasr_chunk_duration_seconds: int = 240
+    dashscope_funasr_max_retries: int = 3
+    dashscope_funasr_sample_rate: int = 16000
     funasr_model: str = "paraformer-zh"
     funasr_device: str = "cpu"
     funasr_vad_model: str = "fsmn-vad"
@@ -684,6 +696,9 @@ class ServiceSettings(BaseSettings):
         "mindmap_concurrency",
         "summary_chunk_concurrency",
         "summary_chunk_retry_count",
+        "dashscope_funasr_chunk_duration_seconds",
+        "dashscope_funasr_max_retries",
+        "dashscope_funasr_sample_rate",
         "visual_evidence_max_frames",
         "visual_evidence_frame_interval_seconds",
         "visual_evidence_frame_width",

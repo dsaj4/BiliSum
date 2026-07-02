@@ -455,6 +455,12 @@ def probe_asr_connection(payload: SettingsUpdatePayload | None = None) -> dict[s
         and current_settings.multimodal_asr_api_key
     ):
         updates.pop("multimodal_asr_api_key")
+    if (
+        "dashscope_funasr_api_key" in updates
+        and is_blank_or_masked_secret(updates["dashscope_funasr_api_key"])
+        and current_settings.dashscope_funasr_api_key
+    ):
+        updates.pop("dashscope_funasr_api_key")
     effective_settings = ServiceSettings.model_validate(
         {**current_settings.model_dump(mode="json"), **updates}
     )
@@ -463,6 +469,8 @@ def probe_asr_connection(payload: SettingsUpdatePayload | None = None) -> dict[s
 
     if provider == "multimodal":
         return _probe_multimodal_asr(effective_settings)
+    if provider == "dashscope_funasr":
+        return _probe_dashscope_funasr(effective_settings)
 
     base_url = str(effective_settings.siliconflow_asr_base_url or "").strip().rstrip("/")
     api_key = str(effective_settings.siliconflow_asr_api_key or "").strip()
@@ -513,6 +521,90 @@ def probe_asr_connection(payload: SettingsUpdatePayload | None = None) -> dict[s
         ),
         "model": model,
         "baseUrl": base_url,
+        "responsePreview": transcript[:120],
+    }
+
+
+def _probe_dashscope_funasr(settings: ServiceSettings) -> dict[str, object]:
+    endpoint = str(settings.dashscope_funasr_endpoint or "").strip()
+    api_key = str(settings.dashscope_funasr_api_key or "").strip()
+    model = str(settings.dashscope_funasr_model or "").strip()
+    sample_rate = max(8000, int(settings.dashscope_funasr_sample_rate or 16000))
+
+    if not endpoint:
+        raise HTTPException(status_code=400, detail="请先填写 DashScope FunASR Endpoint。")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="请先填写 DashScope API Key。")
+    if not model:
+        raise HTTPException(status_code=400, detail="请先填写 DashScope FunASR 模型名称。")
+
+    payload = {
+        "model": model,
+        "input": {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_audio",
+                            "input_audio": {
+                                "data": "https://dashscope.oss-cn-beijing.aliyuncs.com/samples/audio/paraformer/hello_world_female2.wav",
+                            },
+                        }
+                    ],
+                }
+            ]
+        },
+        "parameters": {
+            "format": "wav",
+            "sample_rate": str(sample_rate),
+        },
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "X-DashScope-SSE": "enable",
+    }
+
+    try:
+        timeout = httpx.Timeout(connect=20.0, read=90.0, write=90.0, pool=20.0)
+        with httpx.Client(timeout=timeout) as client:
+            response = client.post(endpoint, headers=headers, json=payload)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"DashScope FunASR 连接失败：{exc}") from exc
+
+    if response.status_code in {401, 403}:
+        detail = extract_http_error_detail(response)
+        raise HTTPException(status_code=response.status_code, detail=f"DashScope FunASR 测试失败：认证失败，{detail}")
+    if response.status_code >= 400:
+        detail = extract_http_error_detail(response)
+        raise HTTPException(status_code=response.status_code, detail=f"DashScope FunASR 测试失败：{detail}")
+
+    transcript = ""
+    for raw_line in response.text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        try:
+            payload = json.loads(line[5:].strip())
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        sentence = payload.get("sentence")
+        if isinstance(sentence, dict):
+            transcript = str(sentence.get("text") or "").strip() or transcript
+        transcript = str(payload.get("text") or "").strip() or transcript
+
+    return {
+        "ok": True,
+        "message": (
+            f"DashScope FunASR 连接测试成功：{model}"
+            if transcript
+            else f"DashScope FunASR 连接测试成功：{model}（接口已响应，但测试音频未返回文本）"
+        ),
+        "model": model,
+        "baseUrl": endpoint,
         "responsePreview": transcript[:120],
     }
 
