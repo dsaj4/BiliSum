@@ -23,8 +23,8 @@ import {
   getTaskPageNumber,
   isAggregateSummaryTask,
   pickDetailTaskId,
-  resolveNoteVariants,
   resolvePrimaryNoteVariant,
+  resolveWorkspaceNoteVariants,
   resolveKnowledgeNoteMarkdown,
   taskPageLabel,
   type DetailTab,
@@ -204,6 +204,11 @@ function noteVariantDescription(variant: NoteVariant): string {
     return "结构化 JSON + Markdown 笔记产物。";
   }
   return "Markdown 笔记产物。";
+}
+
+function noteVariantWorkspaceDescription(variant: NoteVariant, visualDescription = ""): string {
+  const base = noteVariantDescription(variant);
+  return visualDescription ? `${base} · ${visualDescription}` : base;
 }
 
 function resolveDetailedRecordTimeline(variant: NoteVariant | null): DetailedRecordTimelineItem[] {
@@ -1238,10 +1243,9 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
   );
   const areAllChapterGroupsExpanded = chapterGroups.length > 0 && expandedChapterGroupIds.length === chapterGroups.length;
   const selectedKnowledgeNoteMarkdown = useMemo(() => resolveKnowledgeNoteMarkdown(selectedResult), [selectedResult]);
-  const noteVariants = useMemo(() => resolveNoteVariants(selectedResult), [selectedResult]);
+  const noteVariants = useMemo(() => resolveWorkspaceNoteVariants(selectedResult), [selectedResult]);
   const primaryNoteVariant = useMemo(() => resolvePrimaryNoteVariant(selectedResult), [selectedResult]);
   const selectedNoteVariant = noteVariants.find((item) => item.id === selectedNoteVariantId) ?? primaryNoteVariant ?? noteVariants[0] ?? null;
-  const hasMultipleNoteVariants = noteVariants.length > 1;
   const selectedVisualEvidence = selectedTaskId ? visualEvidence[selectedTaskId] ?? null : null;
   const selectedVisualEvidenceStatus = selectedVisualEvidence?.status || selectedTaskDetail?.result?.visual_note_status || "idle";
   const selectedEnhancedNoteMarkdown = selectedVisualEvidence?.enhanced_note_markdown || selectedVisualEvidence?.visual_note_markdown || "";
@@ -1251,6 +1255,13 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
   const hasEnhancedSelectedNote = visualEvidenceMatchesSelectedNote && Boolean(selectedEnhancedNoteMarkdown.trim());
   const showVisualNoteMenuItem = hasEnhancedSelectedNote || (visualEvidenceMatchesSelectedNote && selectedVisualEvidenceStatus === "generating");
   const effectiveKnowledgeNoteViewMode: KnowledgeNoteViewMode = knowledgeNoteViewMode === "visual" && hasEnhancedSelectedNote ? "visual" : "text";
+  const selectedNoteVisualDescription = visualEvidenceMatchesSelectedNote
+    ? (hasEnhancedSelectedNote
+      ? `图文 ${selectedVisualEvidence?.insert_count ?? 0} 处插图 · ${selectedVisualEvidence?.frame_count ?? 0} 张素材`
+      : selectedVisualEvidenceStatus === "generating"
+        ? "图文生成中"
+        : "")
+    : "";
 
   useEffect(() => {
     if (!hasEnhancedSelectedNote && knowledgeNoteViewMode === "visual") {
@@ -1264,7 +1275,7 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
     }
     const nextPrimary = resolvePrimaryNoteVariant(selectedResult);
     setSelectedNoteVariantId((current) => {
-      if (current && resolveNoteVariants(selectedResult).some((item) => item.id === current)) {
+      if (current && resolveWorkspaceNoteVariants(selectedResult).some((item) => item.id === current)) {
         return current;
       }
       return nextPrimary?.id ?? null;
@@ -1272,7 +1283,10 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
   }, [selectedResult]);
   const displayedKnowledgeNoteMarkdown = effectiveKnowledgeNoteViewMode === "visual"
     ? selectedEnhancedNoteMarkdown
-    : selectedNoteVariant?.markdown || selectedKnowledgeNoteMarkdown;
+    : selectedNoteVariant?.markdown || "";
+  const selectedNoteEmptyText = selectedNoteVariant?.id === "detailed_record"
+    ? "当前任务还没有生成逐句实录。"
+    : "当前任务还没有生成知识笔记。";
   const detailedRecordTimeline = useMemo(() => resolveDetailedRecordTimeline(selectedNoteVariant), [selectedNoteVariant]);
   const showDetailedRecordTimeline = selectedNoteVariant?.id === "detailed_record" && detailedRecordTimeline.length > 0;
   const knowledgeNoteModeLabel = selectedNoteVariant
@@ -1290,7 +1304,10 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
         id: `note:${variant.id}`,
         tab: "summary",
         label: variant.label || variant.id,
-        description: noteVariantDescription(variant),
+        description: noteVariantWorkspaceDescription(
+          variant,
+          variant.id === selectedNoteModeId ? selectedNoteVisualDescription : "",
+        ),
         variant,
       }))
       : [{
@@ -1312,7 +1329,7 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
       label: "思维导图",
       description: "预留按主题组织的知识结构视图入口。",
     },
-  ], [noteVariants, selectedKnowledgeNoteMarkdown]);
+  ], [noteVariants, selectedKnowledgeNoteMarkdown, selectedNoteModeId, selectedNoteVisualDescription]);
   const visualKnowledgeNoteUnavailableText = selectedVisualEvidenceStatus === "generating"
     ? "图文笔记生成中，完成后可选"
     : "当前任务没有图文笔记";
@@ -2727,35 +2744,14 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
                             onClick={() => setKnowledgeNoteModeMenuOpen((current) => !current)}
                             aria-haspopup="menu"
                             aria-expanded={knowledgeNoteModeMenuOpen}
-                            aria-label="选择知识笔记显示形式"
-                            title="笔记形式"
+                            aria-label="选择当前笔记模式的显示版本"
+                            title="显示版本"
                           >
                             {effectiveKnowledgeNoteViewMode === "visual" ? <IconCopyImage /> : <IconFileText />}
                             <IconChevronDown className="detail-section-menu-caret" />
                           </button>
                           {knowledgeNoteModeMenuOpen ? (
-                            <div className="detail-section-popover detail-note-mode-popover" role="menu" aria-label="知识笔记显示形式">
-                              {hasMultipleNoteVariants ? noteVariants.map((variant) => (
-                                <button
-                                  key={variant.id}
-                                  className={`detail-section-menu-item detail-note-mode-option ${selectedNoteVariant?.id === variant.id ? "is-selected" : ""}`}
-                                  type="button"
-                                  role="menuitemradio"
-                                  aria-checked={selectedNoteVariant?.id === variant.id}
-                                  onClick={() => {
-                                    setSelectedNoteVariantId(variant.id);
-                                    setKnowledgeNoteModeMenuOpen(false);
-                                  }}
-                                >
-                                  <span className="detail-section-menu-item-icon" aria-hidden="true">
-                                    <IconFileText />
-                                  </span>
-                                  <span className="detail-section-menu-copy">
-                                    <strong>{variant.label || variant.id}</strong>
-                                    <small>{variant.status === "partial" ? "已生成兜底版本" : variant.content_type === "markdown+json" ? "结构化 JSON + Markdown" : "Markdown 笔记"}</small>
-                                  </span>
-                                </button>
-                              )) : null}
+                            <div className="detail-section-popover detail-note-mode-popover" role="menu" aria-label="当前笔记模式的显示版本">
                               {showVisualNoteMenuItem ? (
                               <button
                                 className={`detail-section-menu-item detail-note-mode-option ${effectiveKnowledgeNoteViewMode === "visual" ? "is-selected" : ""}`}
@@ -2776,7 +2772,7 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
                                 </span>
                                 <span className="detail-section-menu-copy">
                                   <strong>图文</strong>
-                                  <small>{hasEnhancedSelectedNote ? "显示带图片的整合笔记" : visualKnowledgeNoteUnavailableText}</small>
+                                  <small>{hasEnhancedSelectedNote ? `显示 ${selectedNoteVariant?.label || "当前模式"} 的带图片版本` : visualKnowledgeNoteUnavailableText}</small>
                                 </span>
                               </button>
                               ) : null}
@@ -2795,7 +2791,7 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
                                 </span>
                                 <span className="detail-section-menu-copy">
                                   <strong>纯文本</strong>
-                                  <small>显示基础知识笔记正文</small>
+                                  <small>{`显示 ${selectedNoteVariant?.label || "当前模式"} 的基础正文`}</small>
                                 </span>
                               </button>
                             </div>
@@ -2874,7 +2870,7 @@ export function VideoDetailPage({ refreshToken = 0, onRefresh, onOpenCookieSetti
                             imageResolver={(src) => resolveVisualNoteImageSrc(selectedTaskId, src)}
                           />
                         ) : (
-                          <p className="detail-section-body">当前任务还没有生成知识笔记。</p>
+                          <p className="detail-section-body">{selectedNoteEmptyText}</p>
                         )}
                       </div>
                       {showDetailedRecordTimeline ? (

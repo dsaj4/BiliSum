@@ -457,6 +457,24 @@ export function resolveNoteVariants(result?: TaskResult | null): NoteVariant[] {
   ];
 }
 
+const WORKSPACE_NOTE_MODE_ORDER: Array<Pick<NoteVariant, "id" | "label" | "content_type">> = [
+  { id: "knowledge_note", label: "知识笔记", content_type: "markdown" },
+  { id: "detailed_record", label: "逐句实录", content_type: "markdown+json" },
+];
+
+export function resolveWorkspaceNoteVariants(result?: TaskResult | null): NoteVariant[] {
+  const variants = resolveNoteVariants(result);
+  const byId = new Map(variants.map((item) => [item.id, item]));
+  const fixedVariants = WORKSPACE_NOTE_MODE_ORDER.map((definition) => byId.get(definition.id) ?? ({
+    ...definition,
+    status: "missing",
+    markdown: "",
+  }));
+  const fixedIds = new Set(WORKSPACE_NOTE_MODE_ORDER.map((item) => item.id));
+  const extraVariants = variants.filter((item) => !fixedIds.has(item.id));
+  return [...fixedVariants, ...extraVariants];
+}
+
 export function resolvePrimaryNoteVariant(result?: TaskResult | null): NoteVariant | null {
   const variants = resolveNoteVariants(result);
   if (!variants.length) {

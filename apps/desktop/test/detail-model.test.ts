@@ -11,6 +11,9 @@ import {
   filterTasksForPage,
   pickDetailTaskId,
   resolveKnowledgeNoteMarkdown,
+  resolveNoteVariants,
+  resolvePrimaryNoteVariant,
+  resolveWorkspaceNoteVariants,
   taskPageLabel,
 } from "../src/detailModel.ts";
 import type { TaskDetail, TaskMindMapResponse, TaskResult, TaskSummary, VideoPageOption } from "../src/types.ts";
@@ -201,6 +204,57 @@ run("builds legacy knowledge note markdown from existing result fields", () => {
   assert.match(markdown, /## 摘要概览/);
   assert.match(markdown, /## 关键要点/);
   assert.match(markdown, /### 章节一/);
+});
+
+run("keeps backend registered note variants as parallel modes", () => {
+  const result = createTaskResult({
+    primary_note_mode: "detailed_record",
+    note_variants: [
+      {
+        id: "knowledge_note",
+        label: "Knowledge note",
+        status: "ready",
+        markdown: "# Knowledge note",
+        content_type: "markdown",
+      },
+      {
+        id: "detailed_record",
+        label: "Detailed record",
+        status: "ready",
+        markdown: "# Detailed record",
+        content_type: "markdown+json",
+        structured: { timeline: [{ title: "Intro", start: 0 }] },
+      },
+    ],
+  });
+
+  const variants = resolveNoteVariants(result);
+  const primary = resolvePrimaryNoteVariant(result);
+
+  assert.deepEqual(variants.map((item) => item.id), ["knowledge_note", "detailed_record"]);
+  assert.equal(primary?.id, "detailed_record");
+});
+
+run("keeps first-class note mode tabs even before artifacts exist", () => {
+  const result = createTaskResult({
+    note_variants: [
+      {
+        id: "knowledge_note",
+        label: "Knowledge note",
+        status: "ready",
+        markdown: "# Knowledge note",
+        content_type: "markdown",
+      },
+    ],
+  });
+
+  const variants = resolveWorkspaceNoteVariants(result);
+  const detailed = variants.find((item) => item.id === "detailed_record");
+
+  assert.deepEqual(variants.slice(0, 2).map((item) => item.id), ["knowledge_note", "detailed_record"]);
+  assert.equal(detailed?.label, "逐句实录");
+  assert.equal(detailed?.status, "missing");
+  assert.equal(detailed?.markdown, "");
 });
 
 run("groups chapter cards into collapsible major chapters", () => {

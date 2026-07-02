@@ -91,6 +91,9 @@ class NoteModeDefinition:
     id: str
     label: str
     description: str
+    artifact_stem: str
+    content_type: str = "markdown"
+    has_structured_artifact: bool = False
 
 
 @dataclass(frozen=True)
@@ -121,11 +124,15 @@ NOTE_MODE_REGISTRY: dict[str, NoteModeDefinition] = {
         id=KNOWLEDGE_NOTE_MODE,
         label="知识笔记",
         description="Legacy semantic Markdown knowledge note.",
+        artifact_stem="knowledge_note",
     ),
     DETAILED_RECORD_MODE: NoteModeDefinition(
         id=DETAILED_RECORD_MODE,
         label="逐句实录",
         description="Discourse-aligned faithful transcript with structured JSON and Markdown.",
+        artifact_stem="detailed_record",
+        content_type="markdown+json",
+        has_structured_artifact=True,
     ),
 }
 
@@ -160,6 +167,10 @@ def normalize_note_modes(value: object, *, default: list[str] | None = None) -> 
 def note_mode_definition(mode: str) -> NoteModeDefinition:
     normalized = normalize_note_modes([mode])[0]
     return NOTE_MODE_REGISTRY[normalized]
+
+
+def note_mode_definitions(modes: list[str]) -> list[NoteModeDefinition]:
+    return [note_mode_definition(mode) for mode in normalize_note_modes(modes)]
 
 
 def normalize_primary_note_mode(note_modes: list[str], primary: str | None = None) -> str:
